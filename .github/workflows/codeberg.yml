@@ -1,0 +1,21 @@
+name: Mirror to Codeberg
+on:
+  workflow_dispatch: # Only runs when you click 'Run workflow' in the GitHub UI
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to Codeberg
+        run: |
+          git remote add codeberg https://$CODEBERG_USER:$CODEBERG_TOKEN@codeberg.org/$FULL_GIT_REPO
+          git push --mirror codeberg
+        env:
+          CODEBERG_USER: cocode
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_ACCESS_TOKEN }}
+          FULL_GIT_REPO: coco_code_github_forks/mautrix-whatsapp.git
