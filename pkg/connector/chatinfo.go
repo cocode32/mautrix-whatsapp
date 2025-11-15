@@ -26,10 +26,10 @@ func (wa *WhatsAppClient) GetChatInfo(ctx context.Context, portal *bridgev2.Port
 	if err != nil {
 		return nil, err
 	}
-	return wa.getChatInfo(ctx, portalJID, nil)
+	return wa.getChatInfo(ctx, portalJID, nil, portal.MXID == "")
 }
 
-func (wa *WhatsAppClient) getChatInfo(ctx context.Context, portalJID types.JID, conv *wadb.Conversation) (wrapped *bridgev2.ChatInfo, err error) {
+func (wa *WhatsAppClient) getChatInfo(ctx context.Context, portalJID types.JID, conv *wadb.Conversation, isNew bool) (wrapped *bridgev2.ChatInfo, err error) {
 	switch portalJID.Server {
 	case types.DefaultUserServer, types.HiddenUserServer, types.BotServer:
 		wrapped = wa.wrapDMInfo(ctx, portalJID)
@@ -40,14 +40,14 @@ func (wa *WhatsAppClient) getChatInfo(ctx context.Context, portalJID types.JID, 
 			return nil, fmt.Errorf("broadcast list bridging is currently not supported")
 		}
 	case types.GroupServer:
-		info, err := wa.Client.GetGroupInfo(portalJID)
+		info, err := wa.Client.GetGroupInfo(ctx, portalJID)
 		if err != nil {
 			return nil, err
 		}
 		wrapped = wa.wrapGroupInfo(ctx, info)
 		wrapped.ExtraUpdates = bridgev2.MergeExtraUpdaters(wrapped.ExtraUpdates, updatePortalLastSyncAt)
 	case types.NewsletterServer:
-		info, err := wa.Client.GetNewsletterInfo(portalJID)
+		info, err := wa.Client.GetNewsletterInfo(ctx, portalJID)
 		if err != nil {
 			return nil, err
 		}
@@ -55,20 +55,22 @@ func (wa *WhatsAppClient) getChatInfo(ctx context.Context, portalJID types.JID, 
 	default:
 		return nil, fmt.Errorf("unsupported server %s", portalJID.Server)
 	}
-	wa.addExtrasToWrapped(ctx, portalJID, wrapped, conv)
+	wa.addExtrasToWrapped(ctx, portalJID, wrapped, conv, isNew)
 	return wrapped, nil
 }
 
-func (wa *WhatsAppClient) addExtrasToWrapped(ctx context.Context, portalJID types.JID, wrapped *bridgev2.ChatInfo, conv *wadb.Conversation) {
-	if conv == nil {
-		var err error
-		conv, err = wa.Main.DB.Conversation.Get(ctx, wa.UserLogin.ID, portalJID)
-		if err != nil {
-			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to get history sync conversation info")
+func (wa *WhatsAppClient) addExtrasToWrapped(ctx context.Context, portalJID types.JID, wrapped *bridgev2.ChatInfo, conv *wadb.Conversation, isNew bool) {
+	if isNew {
+		if conv == nil {
+			var err error
+			conv, err = wa.Main.DB.Conversation.Get(ctx, wa.UserLogin.ID, portalJID)
+			if err != nil {
+				zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to get history sync conversation info")
+			}
 		}
-	}
-	if conv != nil {
-		wa.applyHistoryInfo(wrapped, conv)
+		if conv != nil {
+			wa.applyHistoryInfo(wrapped, conv)
+		}
 	}
 	wa.applyChatSettings(ctx, portalJID, wrapped)
 }
@@ -419,7 +421,7 @@ func (wa *WhatsAppClient) makePortalAvatarFetcher(avatarID string, sender types.
 			existingID = ""
 		}
 		var wrappedAvatar *bridgev2.Avatar
-		avatar, err := wa.Client.GetProfilePictureInfo(jid, &whatsmeow.GetProfilePictureParams{
+		avatar, err := wa.Client.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{
 			ExistingID:  existingID,
 			IsCommunity: portal.RoomType == database.RoomTypeSpace,
 		})
@@ -492,7 +494,7 @@ func (wa *WhatsAppClient) wrapNewsletterInfo(ctx context.Context, info *types.Ne
 	} else if info.ThreadMeta.Preview.ID != "" {
 		avatar.ID = networkid.AvatarID(info.ThreadMeta.Preview.ID)
 		avatar.Get = func(ctx context.Context) ([]byte, error) {
-			meta, err := wa.Client.GetNewsletterInfo(info.ID)
+			meta, err := wa.Client.GetNewsletterInfo(ctx, info.ID)
 			if err != nil {
 				return nil, fmt.Errorf("failed to fetch full res avatar info: %w", err)
 			} else if meta.ThreadMeta.Picture == nil {

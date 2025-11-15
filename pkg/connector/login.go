@@ -74,6 +74,11 @@ var (
 		Err:        "Phone number must be in international format",
 		StatusCode: http.StatusBadRequest,
 	}
+	ErrRateLimitedByWhatsApp = bridgev2.RespError{
+		ErrCode:    "FI.MAU.WHATSAPP.RATE_LIMITED",
+		Err:        "Rate limited by WhatsApp",
+		StatusCode: http.StatusTooManyRequests,
+	}
 )
 
 func (wa *WhatsAppConnector) CreateLogin(_ context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
@@ -196,6 +201,8 @@ func (wl *WALogin) SubmitUserInput(ctx context.Context, input map[string]string)
 			return nil, ErrPhoneNumberTooShort
 		} else if errors.Is(err, whatsmeow.ErrPhoneNumberIsNotInternational) {
 			return nil, ErrPhoneNumberIsNotInternational
+		} else if errors.Is(err, whatsmeow.ErrIQRateOverLimit) {
+			return nil, ErrRateLimitedByWhatsApp
 		}
 		return nil, err
 	}
@@ -352,7 +359,7 @@ func (wl *WALogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 	}
 
 	ul.Client.(*WhatsAppClient).isNewLogin = true
-	ul.Client.Connect(ul.Log.WithContext(context.Background()))
+	ul.Client.Connect(ul.Log.WithContext(wl.Main.Bridge.BackgroundCtx))
 
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeComplete,

@@ -149,7 +149,7 @@ func (wa *WhatsAppClient) doGhostResync(ctx context.Context, queue map[types.JID
 		return
 	}
 	log.Debug().Array("jids", exzerolog.ArrayOfStringers(ghostJIDs)).Msg("Doing background sync for users")
-	infos, err := wa.Client.GetUserInfo(ghostJIDs)
+	infos, err := wa.Client.GetUserInfo(ctx, ghostJIDs)
 	if err != nil {
 		log.Err(err).Msg("Failed to get user info for background sync")
 		return
@@ -194,29 +194,30 @@ func (wa *WhatsAppClient) contactToUserInfo(ctx context.Context, jid types.JID, 
 	} else if jid == types.LegacyPSAJID || jid == types.PSAJID {
 		contact.PushName = "WhatsApp"
 	}
-	var phone string
-	if jid.Server == types.DefaultUserServer {
-		phone = "+" + jid.User
-	} else if jid.Server == types.HiddenUserServer {
-		pnJID, err := wa.GetStore().LIDs.GetPNForLID(ctx, jid)
+	var altJID types.JID
+	if jid.Server == types.DefaultUserServer || jid.Server == types.HiddenUserServer {
+		var err error
+		altJID, err = wa.GetStore().GetAltJID(ctx, jid)
 		if err != nil {
-			zerolog.Ctx(ctx).Err(err).Stringer("lid", jid).Msg("Failed to get PN for LID")
-		} else if pnJID.IsEmpty() {
-			zerolog.Ctx(ctx).Debug().Stringer("lid", jid).Msg("Phone number not found for LID in contactToUserInfo")
+			zerolog.Ctx(ctx).Err(err).Stringer("source_jid", jid).Msg("Failed to get alt JID")
+		} else if altJID.IsEmpty() {
+			zerolog.Ctx(ctx).Debug().Stringer("source_jid", jid).Msg("Alternate JID not found in contactToUserInfo")
 		} else {
-			phone = "+" + pnJID.User
-			extraContact, err := wa.GetStore().Contacts.GetContact(ctx, pnJID)
+			extraContact, err := wa.GetStore().Contacts.GetContact(ctx, altJID)
 			if err != nil {
 				zerolog.Ctx(ctx).Err(err).
-					Stringer("lid", jid).
-					Stringer("pn_jid", pnJID).
-					Msg("Failed to get contact info from PN")
+					Stringer("source_jid", jid).
+					Stringer("alt_jid", altJID).
+					Msg("Failed to get contact info from alternate JID")
 			} else {
-				if contact.FirstName == "" {
-					contact.FirstName = extraContact.FirstName
-				}
-				if contact.FullName == "" {
-					contact.FullName = extraContact.FullName
+				// Phone contact info should only be stored for phone number JIDs
+				if altJID.Server == types.DefaultUserServer {
+					if contact.FirstName == "" {
+						contact.FirstName = extraContact.FirstName
+					}
+					if contact.FullName == "" {
+						contact.FullName = extraContact.FullName
+					}
 				}
 				if contact.PushName == "" {
 					contact.PushName = extraContact.PushName
@@ -224,8 +225,36 @@ func (wa *WhatsAppClient) contactToUserInfo(ctx context.Context, jid types.JID, 
 				if contact.BusinessName == "" {
 					contact.BusinessName = extraContact.BusinessName
 				}
+				if contact.PushName != "" && extraContact.PushName != "" && contact.PushName != extraContact.PushName {
+					zerolog.Ctx(ctx).Debug().
+						Stringer("source_jid", jid).
+						Stringer("alt_jid", altJID).
+						Str("source_push_name", contact.PushName).
+						Str("alt_push_name", extraContact.PushName).
+						Msg("Conflicting push names between JIDs")
+					if altJID.Server == types.DefaultUserServer {
+						contact.PushName = extraContact.PushName
+					}
+				}
+				if contact.BusinessName != "" && extraContact.BusinessName != "" && contact.BusinessName != extraContact.BusinessName {
+					zerolog.Ctx(ctx).Debug().
+						Stringer("source_jid", jid).
+						Stringer("alt_jid", altJID).
+						Str("source_push_name", contact.BusinessName).
+						Str("alt_push_name", extraContact.BusinessName).
+						Msg("Conflicting business names between JIDs")
+					if altJID.Server == types.DefaultUserServer {
+						contact.BusinessName = extraContact.BusinessName
+					}
+				}
 			}
 		}
+	}
+	var phone string
+	if jid.Server == types.DefaultUserServer {
+		phone = "+" + jid.User
+	} else if altJID.Server == types.DefaultUserServer {
+		phone = "+" + altJID.User
 	}
 	ui := &bridgev2.UserInfo{
 		Name:         ptr.Ptr(wa.Main.Config.FormatDisplayname(jid, phone, contact)),
@@ -302,7 +331,7 @@ func (wa *WhatsAppClient) fetchGhostAvatar(ctx context.Context, ghost *bridgev2.
 		existingID = ""
 	}
 	var wrappedAvatar *bridgev2.Avatar
-	avatar, err := wa.Client.GetProfilePictureInfo(jid, &whatsmeow.GetProfilePictureParams{ExistingID: existingID})
+	avatar, err := wa.Client.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{ExistingID: existingID})
 	if errors.Is(err, whatsmeow.ErrProfilePictureNotSet) {
 		wrappedAvatar = &bridgev2.Avatar{
 			ID:     "remove",
@@ -378,9 +407,9 @@ func (wa *WhatsAppClient) syncAltGhostWithInfo(ctx context.Context, jid types.JI
 	var altJID types.JID
 	var err error
 	if jid.Server == types.HiddenUserServer {
-		altJID, err = wa.Device.LIDs.GetPNForLID(ctx, jid)
+		altJID, err = wa.GetStore().LIDs.GetPNForLID(ctx, jid)
 	} else if jid.Server == types.DefaultUserServer {
-		altJID, err = wa.Device.LIDs.GetLIDForPN(ctx, jid)
+		altJID, err = wa.GetStore().LIDs.GetLIDForPN(ctx, jid)
 	}
 	if err != nil {
 		log.Warn().Err(err).

@@ -35,6 +35,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"go.mau.fi/mautrix-whatsapp/pkg/msgconv"
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
 
@@ -61,7 +62,7 @@ func looksEmaily(str string) bool {
 	return false
 }
 
-func (wa *WhatsAppClient) validateIdentifer(number string) (types.JID, error) {
+func (wa *WhatsAppClient) validateIdentifer(ctx context.Context, number string) (types.JID, error) {
 	if strings.HasSuffix(number, "@"+types.BotServer) || strings.HasSuffix(number, "@"+types.HiddenUserServer) {
 		return types.ParseJID(number)
 	} else if strings.HasPrefix(number, waid.BotPrefix) || strings.HasPrefix(number, waid.LIDPrefix) {
@@ -75,7 +76,7 @@ func (wa *WhatsAppClient) validateIdentifer(number string) (types.JID, error) {
 		return types.EmptyJID, ErrInputLooksLikeEmail
 	} else if wa.Client == nil || !wa.Client.IsLoggedIn() {
 		return types.EmptyJID, bridgev2.ErrNotLoggedIn
-	} else if resp, err := wa.Client.IsOnWhatsApp([]string{number}); err != nil {
+	} else if resp, err := wa.Client.IsOnWhatsApp(ctx, []string{number}); err != nil {
 		return types.EmptyJID, fmt.Errorf("failed to check if number is on WhatsApp: %w", err)
 	} else if len(resp) == 0 {
 		return types.EmptyJID, fmt.Errorf("the server did not respond to the query")
@@ -109,7 +110,7 @@ func (wa *WhatsAppConnector) ValidateUserID(id networkid.UserID) bool {
 
 func (wa *WhatsAppClient) startChatLIDToPN(ctx context.Context, jid types.JID) (types.JID, error) {
 	if jid.Server == types.HiddenUserServer {
-		pn, err := wa.Device.LIDs.GetPNForLID(ctx, jid)
+		pn, err := wa.GetStore().LIDs.GetPNForLID(ctx, jid)
 		if err != nil {
 			return jid, fmt.Errorf("failed to get phone number for lid: %w", err)
 		} else if pn.IsEmpty() {
@@ -143,7 +144,7 @@ func (wa *WhatsAppClient) CreateChatWithGhost(ctx context.Context, ghost *bridge
 }
 
 func (wa *WhatsAppClient) ResolveIdentifier(ctx context.Context, identifier string, startChat bool) (*bridgev2.ResolveIdentifierResponse, error) {
-	origJID, err := wa.validateIdentifer(identifier)
+	origJID, err := wa.validateIdentifer(ctx, identifier)
 	if err != nil {
 		return nil, err
 	}
@@ -164,11 +165,11 @@ func (wa *WhatsAppClient) ResolveIdentifier(ctx context.Context, identifier stri
 }
 
 func (wa *WhatsAppClient) GetContactList(ctx context.Context) ([]*bridgev2.ResolveIdentifierResponse, error) {
-	return wa.getContactList(ctx, "")
+	return wa.getContactList(ctx, "", true)
 }
 
 func (wa *WhatsAppClient) SearchUsers(ctx context.Context, query string) ([]*bridgev2.ResolveIdentifierResponse, error) {
-	return wa.getContactList(ctx, strings.ToLower(query))
+	return wa.getContactList(ctx, strings.ToLower(query), false)
 }
 
 func matchesQuery(str string, query string) bool {
@@ -178,7 +179,7 @@ func matchesQuery(str string, query string) bool {
 	return strings.Contains(strings.ToLower(str), query)
 }
 
-func (wa *WhatsAppClient) getContactList(ctx context.Context, filter string) ([]*bridgev2.ResolveIdentifierResponse, error) {
+func (wa *WhatsAppClient) getContactList(ctx context.Context, filter string, onlyContacts bool) ([]*bridgev2.ResolveIdentifierResponse, error) {
 	if !wa.IsLoggedIn() {
 		return nil, mautrix.MForbidden.WithMessage("You must be logged in to list contacts")
 	}
@@ -188,6 +189,9 @@ func (wa *WhatsAppClient) getContactList(ctx context.Context, filter string) ([]
 	}
 	resp := make([]*bridgev2.ResolveIdentifierResponse, 0, len(contacts))
 	for jid, contactInfo := range contacts {
+		if onlyContacts && contactInfo.FirstName == "" {
+			continue
+		}
 		if !matchesQuery(contactInfo.PushName, filter) && !matchesQuery(contactInfo.FullName, filter) && !matchesQuery(jid.User, filter) {
 			continue
 		}
@@ -213,7 +217,13 @@ func (wa *WhatsAppClient) CreateGroup(ctx context.Context, params *bridgev2.Grou
 		CreateKey:    createKey,
 	}
 	for i, participant := range params.Participants {
-		req.Participants[i] = waid.ParseUserID(participant)
+		jid := waid.ParseUserID(participant)
+		// Normalize to PN if it's a LID
+		jid, err := wa.startChatLIDToPN(ctx, jid)
+		if err != nil {
+			return nil, fmt.Errorf("failed to normalize participant %s: %w", participant, err)
+		}
+		req.Participants[i] = jid
 	}
 	if params.Parent != nil {
 		var err error
@@ -246,6 +256,39 @@ func (wa *WhatsAppClient) CreateGroup(ctx context.Context, params *bridgev2.Grou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create group: %w", err)
 	}
+	failedParticipants := make(map[networkid.UserID]*bridgev2.CreateChatFailedParticipant)
+	filteredParticipants := resp.Participants[:0]
+	for _, pcp := range resp.Participants {
+		if pcp.Error != 0 {
+			var inviteContent *event.Content
+			if pcp.AddRequest != nil {
+				inviteContent = &event.Content{
+					Raw: map[string]any{
+						msgconv.GroupInviteMetaField: &waid.GroupInviteMeta{
+							JID:           resp.JID,
+							Code:          pcp.AddRequest.Code,
+							Expiration:    pcp.AddRequest.Expiration.Unix(),
+							Inviter:       wa.JID.ToNonAD(),
+							GroupName:     resp.Name,
+							IsParentGroup: resp.IsParent,
+						},
+					},
+					Parsed: &event.MessageEventContent{
+						Body:    "Invitation to join my WhatsApp group",
+						MsgType: event.MsgText,
+					},
+				}
+			}
+			failedParticipants[waid.MakeUserID(pcp.JID)] = &bridgev2.CreateChatFailedParticipant{
+				Reason:          fmt.Sprintf("error %d", pcp.Error),
+				InviteEventType: event.EventMessage.Type,
+				InviteContent:   inviteContent,
+			}
+		} else {
+			filteredParticipants = append(filteredParticipants, pcp)
+		}
+	}
+	resp.Participants = filteredParticipants
 	portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(resp.JID))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get portal: %w", err)
@@ -281,7 +324,7 @@ func (wa *WhatsAppClient) CreateGroup(ctx context.Context, params *bridgev2.Grou
 	}
 	changed := false
 	if avatarBytes != nil {
-		avatarID, err := wa.Client.SetGroupPhoto(resp.JID, avatarBytes)
+		avatarID, err := wa.Client.SetGroupPhoto(ctx, resp.JID, avatarBytes)
 		if err != nil {
 			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to set group avatar after creating group")
 		} else {
@@ -298,7 +341,7 @@ func (wa *WhatsAppClient) CreateGroup(ctx context.Context, params *bridgev2.Grou
 	}
 	if params.Topic != nil {
 		newTopicID := wa.Client.GenerateMessageID()
-		err = wa.Client.SetGroupTopic(resp.JID, "", newTopicID, params.Topic.Topic)
+		err = wa.Client.SetGroupTopic(ctx, resp.JID, "", newTopicID, params.Topic.Topic)
 		if err != nil {
 			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to set group topic after creating group")
 		} else {
@@ -319,5 +362,7 @@ func (wa *WhatsAppClient) CreateGroup(ctx context.Context, params *bridgev2.Grou
 		PortalKey:  wa.makeWAPortalKey(resp.JID),
 		Portal:     portal,
 		PortalInfo: groupInfo,
+
+		FailedParticipants: failedParticipants,
 	}, nil
 }

@@ -193,6 +193,20 @@ func (wa *WhatsAppClient) handleWAHistorySync(ctx context.Context, evt *waHistor
 			log.Debug().Stringer("chat_jid", jid).Msg("Skipping broadcast list in history sync")
 			continue
 		}
+		if jid.Server == types.HiddenUserServer {
+			pn, err := wa.GetStore().LIDs.GetPNForLID(ctx, jid)
+			if err != nil {
+				log.Err(err).Stringer("lid", jid).Msg("Failed to get PN for LID in history sync")
+			} else if pn.IsEmpty() {
+				log.Warn().Stringer("lid", jid).Msg("No PN found for LID in history sync")
+			} else {
+				log.Debug().
+					Stringer("lid", jid).
+					Stringer("pn", pn).
+					Msg("Rerouting LID DM to phone number in history sync")
+				jid = pn
+			}
+		}
 		totalMessageCount += len(conv.GetMessages())
 		log := log.With().
 			Stringer("chat_jid", jid).
@@ -342,7 +356,7 @@ func (wa *WhatsAppClient) createPortalsFromHistorySync(ctx context.Context) {
 			log.Warn().Err(ctx.Err()).Msg("Context cancelled, stopping history sync portal creation")
 			return
 		}
-		wrappedInfo, err := wa.getChatInfo(ctx, conv.ChatJID, conv)
+		wrappedInfo, err := wa.getChatInfo(ctx, conv.ChatJID, conv, true)
 		if errors.Is(err, whatsmeow.ErrNotInGroup) {
 			log.Debug().Stringer("chat_jid", conv.ChatJID).
 				Msg("Skipping creating room because the user is not a participant")
@@ -534,10 +548,10 @@ func (wa *WhatsAppClient) convertHistorySyncMessage(
 		TxnID:            networkid.TransactionID(waid.MakeMessageID(info.Chat, info.Sender, info.ID)),
 		Timestamp:        info.Timestamp,
 		StreamOrder:      info.Timestamp.Unix(),
-		Reactions:        make([]*bridgev2.BackfillReaction, len(reactions)),
+		Reactions:        make([]*bridgev2.BackfillReaction, 0, len(reactions)),
 	}
 	mediaReq := wa.processFailedMedia(ctx, portal.PortalKey, wrapped.ID, wrapped.ConvertedMessage, true)
-	for i, reaction := range reactions {
+	for _, reaction := range reactions {
 		var sender types.JID
 		if reaction.GetKey().GetFromMe() {
 			sender = wa.JID
@@ -549,12 +563,12 @@ func (wa *WhatsAppClient) convertHistorySyncMessage(
 		if sender.IsEmpty() {
 			continue
 		}
-		wrapped.Reactions[i] = &bridgev2.BackfillReaction{
+		wrapped.Reactions = append(wrapped.Reactions, &bridgev2.BackfillReaction{
 			TargetPart: ptr.Ptr(networkid.PartID("")),
 			Timestamp:  time.UnixMilli(reaction.GetSenderTimestampMS()),
 			Sender:     wa.makeEventSender(ctx, sender),
 			Emoji:      reaction.GetText(),
-		}
+		})
 	}
 	return wrapped, mediaReq
 }
