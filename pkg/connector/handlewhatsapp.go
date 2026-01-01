@@ -347,6 +347,11 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 	if parsedMessageType == "ignore" || strings.HasPrefix(parsedMessageType, "unknown_protocol_") {
 		return
 	}
+
+	// CUSTOM: Intercept revoke messages - send a notice instead of deleting
+	if parsedMessageType == "revoke" {
+		return wa.handleWAMessageRevoke(ctx, evt)
+	}
 	if encReact := evt.Message.GetEncReactionMessage(); encReact != nil {
 		decrypted, err := wa.Client.DecryptReaction(ctx, evt)
 		if err != nil {
@@ -386,6 +391,80 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 		parsedMessageType: parsedMessageType,
 	})
 	return res.Success
+}
+
+// handleWAMessageRevoke handles message revoke events by sending a notice
+// instead of deleting the message. This preserves the original message and
+// adds a reply indicating it was revoked.
+func (wa *WhatsAppClient) handleWAMessageRevoke(ctx context.Context, evt *events.Message) bool {
+	protocolMsg := evt.Message.GetProtocolMessage()
+	if protocolMsg == nil || protocolMsg.GetKey() == nil {
+		return true
+	}
+
+	revokedKey := protocolMsg.GetKey()
+	revokedMsgID := revokedKey.GetID()
+	senderJID := types.JID{
+		User:   revokedKey.GetRemoteJID(),
+		Server: types.DefaultUserServer,
+	}
+	if revokedKey.GetFromMe() {
+		senderJID = evt.Info.Sender
+	}
+
+	// Determine who revoked the message
+	var revokerName string
+	if evt.Info.IsFromMe {
+		revokerName = "You"
+	} else {
+		revokerName = evt.Info.PushName
+		if revokerName == "" {
+			revokerName = evt.Info.Sender.User
+		}
+	}
+
+	wa.UserLogin.Log.Info().
+		Str("revoked_message_id", revokedMsgID).
+		Str("revoker", revokerName).
+		Stringer("chat", evt.Info.Chat).
+		Msg("Message was revoked - sending notice instead of deleting")
+
+	// Create a notice message that will be sent as a reply
+	noticeText := fmt.Sprintf("⚠️ %s revoked a message", revokerName)
+
+	// Queue a simple message event with the revoke notice
+	// We use the revoke event's info but send it as a text notice
+	return wa.UserLogin.QueueRemoteEvent(&simplevent.Message[*waE2E.Message]{
+		EventMeta: simplevent.EventMeta{
+			Type: bridgev2.RemoteEventMessage,
+			LogContext: func(c zerolog.Context) zerolog.Context {
+				return c.
+					Str("revoked_message_id", revokedMsgID).
+					Str("revoker", revokerName)
+			},
+			PortalKey:    wa.makeWAPortalKey(evt.Info.Chat),
+			Sender:       wa.makeEventSender(ctx, evt.Info.Sender),
+			CreatePortal: false,
+			Timestamp:    evt.Info.Timestamp,
+		},
+		ID:            networkid.MessageID(evt.Info.ID),
+		TargetMessage: waid.MakeMessageID(evt.Info.Chat, senderJID, revokedMsgID),
+		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *waE2E.Message) (*bridgev2.ConvertedMessage, error) {
+			return &bridgev2.ConvertedMessage{
+				Parts: []*bridgev2.ConvertedMessagePart{{
+					Type: event.EventMessage,
+					Content: &event.MessageEventContent{
+						MsgType: event.MsgNotice,
+						Body:    noticeText,
+					},
+				}},
+				ReplyTo: &networkid.MessageOptionalPartID{
+					MessageID: waid.MakeMessageID(evt.Info.Chat, senderJID, revokedMsgID),
+				},
+			}, nil
+		},
+		Data: evt.Message,
+	}).Success
 }
 
 func (wa *WhatsAppClient) handleWAUndecryptableMessage(ctx context.Context, evt *events.UndecryptableMessage) bool {
