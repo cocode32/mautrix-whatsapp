@@ -348,10 +348,16 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 		return
 	}
 
-	// CUSTOM: Intercept revoke messages - send a notice instead of deleting
+	// CocoCode Custom Handling
+	// CocoCode: Intercept revoke messages - send a notice instead of deleting
 	if parsedMessageType == "revoke" {
 		return wa.handleWAMessageRevoke(ctx, evt)
 	}
+	// CocoCode: Intercept edit messages - send a reply with new content instead of replacing
+	if parsedMessageType == "edit" {
+		return wa.handleWAMessageEdit(ctx, evt)
+	}
+
 	if encReact := evt.Message.GetEncReactionMessage(); encReact != nil {
 		decrypted, err := wa.Client.DecryptReaction(ctx, evt)
 		if err != nil {
@@ -465,6 +471,112 @@ func (wa *WhatsAppClient) handleWAMessageRevoke(ctx context.Context, evt *events
 		},
 		Data: evt.Message,
 	}).Success
+}
+
+// handleWAMessageEdit handles message edit events by sending a reply with the
+// new content instead of replacing the original message inline. This preserves
+// the original message and shows what it was edited to.
+func (wa *WhatsAppClient) handleWAMessageEdit(ctx context.Context, evt *events.Message) bool {
+	protocolMsg := evt.Message.GetProtocolMessage()
+	if protocolMsg == nil || protocolMsg.GetKey() == nil {
+		return true
+	}
+
+	editedKey := protocolMsg.GetKey()
+	editedMsgID := editedKey.GetID()
+	editedMessage := protocolMsg.GetEditedMessage()
+
+	senderJID := types.JID{
+		User:   editedKey.GetRemoteJID(),
+		Server: types.DefaultUserServer,
+	}
+	if editedKey.GetFromMe() {
+		senderJID = evt.Info.Sender
+	}
+
+	// Determine who edited the message
+	var editorName string
+	if evt.Info.IsFromMe {
+		editorName = "You"
+	} else {
+		editorName = evt.Info.PushName
+		if editorName == "" {
+			editorName = evt.Info.Sender.User
+		}
+	}
+
+	// Extract the new message content
+	var newContent string
+	if editedMessage != nil {
+		if editedMessage.GetConversation() != "" {
+			newContent = editedMessage.GetConversation()
+		} else if editedMessage.GetExtendedTextMessage() != nil {
+			newContent = editedMessage.GetExtendedTextMessage().GetText()
+		} else if editedMessage.GetImageMessage() != nil {
+			newContent = "[Image] " + editedMessage.GetImageMessage().GetCaption()
+		} else if editedMessage.GetVideoMessage() != nil {
+			newContent = "[Video] " + editedMessage.GetVideoMessage().GetCaption()
+		} else if editedMessage.GetDocumentMessage() != nil {
+			newContent = "[Document] " + editedMessage.GetDocumentMessage().GetCaption()
+		} else {
+			newContent = "[Edited media message]"
+		}
+	}
+
+	if newContent == "" {
+		newContent = "[Empty or unsupported edit]"
+	}
+
+	wa.UserLogin.Log.Info().
+		Str("edited_message_id", editedMsgID).
+		Str("editor", editorName).
+		Stringer("chat", evt.Info.Chat).
+		Str("new_content_preview", truncateString(newContent, 50)).
+		Msg("Message was edited - sending notice with new content instead of replacing")
+
+	// Create a notice message that will be sent as a reply
+	noticeText := fmt.Sprintf("✏️ %s edited this message:\n\n%s", editorName, newContent)
+
+	// Queue a simple message event with the edit notice
+	return wa.UserLogin.QueueRemoteEvent(&simplevent.Message[*waE2E.Message]{
+		EventMeta: simplevent.EventMeta{
+			Type: bridgev2.RemoteEventMessage,
+			LogContext: func(c zerolog.Context) zerolog.Context {
+				return c.
+					Str("edited_message_id", editedMsgID).
+					Str("editor", editorName)
+			},
+			PortalKey:    wa.makeWAPortalKey(evt.Info.Chat),
+			Sender:       wa.makeEventSender(ctx, evt.Info.Sender),
+			CreatePortal: false,
+			Timestamp:    evt.Info.Timestamp,
+		},
+		ID:            networkid.MessageID(evt.Info.ID),
+		TargetMessage: waid.MakeMessageID(evt.Info.Chat, senderJID, editedMsgID),
+		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *waE2E.Message) (*bridgev2.ConvertedMessage, error) {
+			return &bridgev2.ConvertedMessage{
+				Parts: []*bridgev2.ConvertedMessagePart{{
+					Type: event.EventMessage,
+					Content: &event.MessageEventContent{
+						MsgType: event.MsgNotice,
+						Body:    noticeText,
+					},
+				}},
+				ReplyTo: &networkid.MessageOptionalPartID{
+					MessageID: waid.MakeMessageID(evt.Info.Chat, senderJID, editedMsgID),
+				},
+			}, nil
+		},
+		Data: evt.Message,
+	}).Success
+}
+
+// truncateString truncates a string to maxLen characters and adds "..." if truncated
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
 
 func (wa *WhatsAppClient) handleWAUndecryptableMessage(ctx context.Context, evt *events.UndecryptableMessage) bool {
