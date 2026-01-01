@@ -192,6 +192,7 @@ func (wa *WhatsAppClient) Connect(ctx context.Context) {
 		wa.UserLogin.BridgeState.Send(state)
 		return
 	}
+	wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
 	wa.Main.firstClientConnectOnce.Do(wa.Main.onFirstClientConnect)
 	if err := wa.Main.updateProxy(ctx, wa.Client, false); err != nil {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to update proxy")
@@ -201,6 +202,7 @@ func (wa *WhatsAppClient) Connect(ctx context.Context) {
 	}
 	wa.startLoops()
 	wa.Client.BackgroundEventCtx = wa.UserLogin.Log.WithContext(wa.Main.Bridge.BackgroundCtx)
+	zerolog.Ctx(ctx).Debug().Msg("Connecting to WhatsApp")
 	if err := wa.Client.ConnectContext(ctx); err != nil {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to connect to WhatsApp")
 		state := status.BridgeState{
@@ -259,7 +261,7 @@ func (wa *WhatsAppClient) ConnectBackground(ctx context.Context, params *bridgev
 	defer func() {
 		wa.Client.GetClientPayload = nil
 	}()
-	err := wa.Client.Connect()
+	err := wa.Client.ConnectContext(ctx)
 	if err != nil {
 		return err
 	}

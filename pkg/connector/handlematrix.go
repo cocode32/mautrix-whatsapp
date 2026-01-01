@@ -390,18 +390,18 @@ func (wa *WhatsAppClient) HandleMatrixDisappearingTimer(ctx context.Context, msg
 	return true, nil
 }
 
-func (wa *WhatsAppClient) HandleMatrixMembership(ctx context.Context, msg *bridgev2.MatrixMembershipChange) (bool, error) {
+func (wa *WhatsAppClient) HandleMatrixMembership(ctx context.Context, msg *bridgev2.MatrixMembershipChange) (*bridgev2.MatrixMembershipResult, error) {
 	portalJID, err := waid.ParsePortalID(msg.Portal.ID)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
 	if msg.Portal.RoomType == database.RoomTypeDM {
 		switch msg.Type {
 		case bridgev2.Invite:
-			return false, fmt.Errorf("cannot invite additional user to dm")
+			return nil, fmt.Errorf("cannot invite additional user to dm")
 		default:
-			return false, nil
+			return nil, nil
 		}
 	}
 
@@ -414,7 +414,7 @@ func (wa *WhatsAppClient) HandleMatrixMembership(ctx context.Context, msg *bridg
 	case bridgev2.Leave, bridgev2.Kick:
 		action = whatsmeow.ParticipantChangeRemove
 	default:
-		return false, nil
+		return nil, nil
 	}
 
 	switch target := msg.Target.(type) {
@@ -423,19 +423,26 @@ func (wa *WhatsAppClient) HandleMatrixMembership(ctx context.Context, msg *bridg
 	case *bridgev2.UserLogin:
 		ghost, err := target.Bridge.GetGhostByID(ctx, networkid.UserID(target.ID))
 		if err != nil {
-			return false, fmt.Errorf("failed to get ghost for user: %w", err)
+			return nil, fmt.Errorf("failed to get ghost for user: %w", err)
 		}
 		changes[0] = waid.ParseUserID(ghost.ID)
 	default:
-		return false, fmt.Errorf("cannot get target intent: unknown type: %T", target)
+		return nil, fmt.Errorf("cannot get target intent: unknown type: %T", target)
 	}
 
-	_, err = wa.Client.UpdateGroupParticipants(ctx, portalJID, changes, action)
+	resp, err := wa.Client.UpdateGroupParticipants(ctx, portalJID, changes, action)
 	if err != nil {
-		return false, err
+		return nil, err
+	} else if len(resp) == 0 {
+		return nil, fmt.Errorf("no response for participant change")
+	} else if resp[0].Error != 0 {
+		return nil, fmt.Errorf("failed to change participant: code %d", resp[0].Error)
 	}
+	zerolog.Ctx(ctx).Debug().
+		Any("change_response", resp).
+		Msg("Handled membership change")
 
-	return true, nil
+	return &bridgev2.MatrixMembershipResult{RedirectTo: waid.MakeUserID(resp[0].JID)}, nil
 }
 
 func (wa *WhatsAppClient) HandleMatrixRoomName(ctx context.Context, msg *bridgev2.MatrixRoomName) (bool, error) {
@@ -639,6 +646,18 @@ func (wa *WhatsAppClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridg
 	chatJID, err := waid.ParsePortalID(msg.Portal.ID)
 	if err != nil {
 		return err
+	}
+	if chatJID.Server == types.GroupServer {
+		memberInfo, err := wa.Main.Bridge.Matrix.GetMemberInfo(ctx, msg.Portal.MXID, wa.UserLogin.UserMXID)
+		if err != nil {
+			return fmt.Errorf("failed to get own member info: %w", err)
+		} else if memberInfo.Membership == event.MembershipJoin {
+			err = wa.Client.LeaveGroup(ctx, chatJID)
+			if err != nil {
+				// TODO ignore errors saying you already left the group?
+				return fmt.Errorf("failed to leave group before deleting chat: %w", err)
+			}
+		}
 	}
 	lastTS, lastKey, err := wa.getLastMessageInfo(ctx, chatJID, msg.Portal.PortalKey)
 	if err != nil {

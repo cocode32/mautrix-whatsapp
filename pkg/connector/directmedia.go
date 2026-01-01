@@ -29,6 +29,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exsync"
+	"go.mau.fi/util/ptr"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waMmsRetry"
 	"go.mau.fi/whatsmeow/types/events"
@@ -85,7 +86,7 @@ func (wa *WhatsAppConnector) downloadAvatarDirectMedia(ctx context.Context, pars
 		return nil, fmt.Errorf("failed to get avatar cache entry: %w", err)
 	}
 	if cachedInfo != nil && cachedInfo.Gone {
-		return nil, mautrix.MNotFound.WithMessage("Avatar is no longer available")
+		return nil, mautrix.MNotFound.WithMessage("Avatar is no longer available (cached response)")
 	} else if cachedInfo == nil || cachedInfo.Expiry.Time.Before(time.Now().Add(5*time.Minute)) {
 		zerolog.Ctx(ctx).Debug().
 			Str("avatar_id", parsedID.Avatar.AvatarID).
@@ -96,6 +97,13 @@ func (wa *WhatsAppConnector) downloadAvatarDirectMedia(ctx context.Context, pars
 		if errors.Is(err, whatsmeow.ErrProfilePictureNotSet) ||
 			errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized) ||
 			(err == nil && (avatar == nil || avatar.ID != parsedID.Avatar.AvatarID)) {
+			zerolog.Ctx(ctx).Debug().
+				Err(err).
+				Stringer("target_jid", parsedID.Avatar.TargetJID).
+				Bool("is_community", parsedID.Avatar.Community).
+				Str("wanted_avatar_id", parsedID.Avatar.AvatarID).
+				Str("got_avatar_id", ptr.Val(avatar).ID).
+				Msg("Avatar is no longer available")
 			err = wa.DB.AvatarCache.Put(ctx, &wadb.AvatarCacheEntry{
 				EntityJID: parsedID.Avatar.TargetJID,
 				AvatarID:  parsedID.Avatar.AvatarID,
@@ -119,12 +127,11 @@ func (wa *WhatsAppConnector) downloadAvatarDirectMedia(ctx context.Context, pars
 		}
 	}
 	return &mediaproxy.GetMediaResponseFile{
-		Callback: func(w *os.File) error {
-			return waClient.Client.DownloadMediaWithPathToFile(
+		Callback: func(w *os.File) (*mediaproxy.FileMeta, error) {
+			return &mediaproxy.FileMeta{}, waClient.Client.DownloadMediaWithPathToFile(
 				ctx, cachedInfo.DirectPath, nil, nil, nil, 0, "", "", w,
 			)
 		},
-		ContentType: "", // TODO are avatars always jpeg?
 	}, nil
 }
 
@@ -168,18 +175,18 @@ func (wa *WhatsAppConnector) downloadMessageDirectMedia(ctx context.Context, par
 		return nil, fmt.Errorf("no WhatsApp client found on login")
 	}
 	return &mediaproxy.GetMediaResponseFile{
-		Callback: func(f *os.File) error {
+		Callback: func(f *os.File) (*mediaproxy.FileMeta, error) {
 			err := waClient.Client.DownloadToFile(ctx, keys, f)
 			if errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) || errors.Is(err, whatsmeow.ErrNoURLPresent) {
 				val := params["fi.mau.whatsapp.reload_media"]
 				if val == "false" || (!wa.Config.DirectMediaAutoRequest && val != "true") {
-					return ErrReloadNeeded
+					return nil, ErrReloadNeeded
 				}
 				log.Trace().Msg("Media not found for direct download, requesting and waiting")
 				err = waClient.requestAndWaitDirectMedia(ctx, msg.ID, keys)
 				if err != nil {
 					log.Trace().Err(err).Msg("Failed to wait for media for direct download")
-					return err
+					return nil, err
 				}
 				log.Trace().Msg("Retrying download after successful retry")
 				err = waClient.Client.DownloadToFile(ctx, keys, f)
@@ -187,27 +194,29 @@ func (wa *WhatsAppConnector) downloadMessageDirectMedia(ctx context.Context, par
 			if errors.Is(err, whatsmeow.ErrFileLengthMismatch) || errors.Is(err, whatsmeow.ErrInvalidMediaSHA256) {
 				zerolog.Ctx(ctx).Warn().Err(err).Msg("Mismatching media checksums in message. Ignoring because WhatsApp seems to ignore them too")
 			} else if err != nil {
-				return err
+				return nil, err
 			}
 
-			if keys.MimeType == "application/was" {
+			mime := keys.MimeType
+			if mime == "application/was" {
 				if _, err := f.Seek(0, io.SeekStart); err != nil {
-					return fmt.Errorf("failed to seek to start of sticker zip: %w", err)
+					return nil, fmt.Errorf("failed to seek to start of sticker zip: %w", err)
 				} else if zipData, err := io.ReadAll(f); err != nil {
-					return fmt.Errorf("failed to read sticker zip: %w", err)
+					return nil, fmt.Errorf("failed to read sticker zip: %w", err)
 				} else if data, err := msgconv.ExtractAnimatedSticker(zipData); err != nil {
-					return fmt.Errorf("failed to extract animated sticker: %w %x", err, zipData)
+					return nil, fmt.Errorf("failed to extract animated sticker: %w %x", err, zipData)
 				} else if _, err := f.WriteAt(data, 0); err != nil {
-					return fmt.Errorf("failed to write animated sticker to file: %w", err)
+					return nil, fmt.Errorf("failed to write animated sticker to file: %w", err)
 				} else if err := f.Truncate(int64(len(data))); err != nil {
-					return fmt.Errorf("failed to truncate animated sticker file: %w", err)
+					return nil, fmt.Errorf("failed to truncate animated sticker file: %w", err)
 				}
+				mime = "video/lottie+json"
 			}
 
-			return nil
+			return &mediaproxy.FileMeta{
+				ContentType: mime,
+			}, nil
 		},
-		// TODO?
-		ContentType: "",
 	}, nil
 }
 
