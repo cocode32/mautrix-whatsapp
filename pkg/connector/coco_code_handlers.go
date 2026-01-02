@@ -7,6 +7,8 @@
 // - Message edit notices (instead of replacing messages)
 // - Delivery status reactions (📭 sent, 📩 delivered, 👀 read)
 // - Profile picture update notices (with image preview)
+// - Current profile picture on contact save
+// - Current profile picture on portal creation / backfill complete
 
 package connector
 
@@ -311,28 +313,35 @@ func (wa *WhatsAppClient) sendMatrixDeliveryReaction(ctx context.Context, evt *e
 	}
 }
 
-// sendMatrixPictureUpdateNotice sends a profile picture update notice to Matrix.
-// If picture was updated, includes the image with proper dimensions for inline display.
-// If removed, sends text notice.
-// Uses direct Matrix API - this is a LOCAL event only, never goes to WhatsApp.
-func (wa *WhatsAppClient) sendMatrixPictureUpdateNotice(ctx context.Context, evt *events.Picture) {
+// sendMatrixCurrentProfilePicture sends the current profile picture for a contact to their chat.
+// This is used when:
+// - A new portal is created (first message in the chat)
+// - Backfill is completed (last message to show current state)
+// - A contact is saved on the phone
+// The message format is: "📷 {Name}'s current profile picture"
+func (wa *WhatsAppClient) sendMatrixCurrentProfilePicture(ctx context.Context, jid types.JID, reason string) {
 	log := wa.UserLogin.Log.With().
-		Str("action", "coco_picture_notice").
-		Stringer("jid", evt.JID).
-		Str("picture_id", evt.PictureID).
-		Bool("removed", evt.Remove).
+		Str("action", "coco_current_picture").
+		Stringer("jid", jid).
+		Str("reason", reason).
 		Logger()
 
+	// Skip non-user JIDs (groups, broadcasts, etc.)
+	if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
+		log.Debug().Msg("Skipping current picture for non-user JID")
+		return
+	}
+
 	// Normalize JID to phone number for portal lookup
-	portalJID := evt.JID
-	if evt.JID.Server == types.HiddenUserServer {
-		pn, err := wa.GetStore().LIDs.GetPNForLID(ctx, evt.JID)
+	portalJID := jid
+	if jid.Server == types.HiddenUserServer {
+		pn, err := wa.GetStore().LIDs.GetPNForLID(ctx, jid)
 		if err != nil {
-			log.Err(err).Msg("Failed to get phone number for LID in picture notice")
+			log.Err(err).Msg("Failed to get phone number for LID")
 		} else if !pn.IsEmpty() {
 			portalJID = pn
 			log.Debug().
-				Stringer("original_jid", evt.JID).
+				Stringer("original_jid", jid).
 				Stringer("normalized_jid", portalJID).
 				Msg("Normalized LID to phone number for portal lookup")
 		}
@@ -342,44 +351,43 @@ func (wa *WhatsAppClient) sendMatrixPictureUpdateNotice(ctx context.Context, evt
 	portalKey := wa.makeWAPortalKey(portalJID)
 	portal, err := wa.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 	if err != nil {
-		log.Err(err).Msg("Failed to get portal for picture notice")
+		log.Err(err).Msg("Failed to get portal for current picture")
 		return
 	}
 	if portal == nil {
-		log.Debug().Msg("Portal doesn't exist, skipping picture notice")
+		log.Debug().Msg("Portal doesn't exist, skipping current picture")
 		return
 	}
 
 	// Get the contact name
-	userInfo, _ := wa.getUserInfo(ctx, evt.JID, false)
+	userInfo, _ := wa.getUserInfo(ctx, jid, false)
 	contactName := *userInfo.Name
 
-	if evt.Remove {
-		// Picture was removed - send a text notice
-		noticeText := fmt.Sprintf("📷 %s removed their profile picture", contactName)
-		content := &event.MessageEventContent{
-			MsgType: event.MsgNotice,
-			Body:    noticeText,
-		}
-
-		if err := wa.sendMatrixMessage(ctx, portal.MXID, content); err != nil {
-			log.Err(err).Msg("Failed to send picture removal notice to Matrix")
-		} else {
-			log.Info().Msg("Sent profile picture removal notice")
-		}
-		return
-	}
-
-	// Picture was updated - fetch and send the full picture
-	pictureInfo, err := wa.Client.GetProfilePictureInfo(ctx, evt.JID, &whatsmeow.GetProfilePictureParams{
+	// Get the profile picture info
+	pictureInfo, err := wa.Client.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{
 		Preview: false, // Get full resolution
 	})
 	if err != nil {
-		log.Err(err).Msg("Failed to get profile picture info")
+		log.Debug().Err(err).Msg("Failed to get profile picture info (user may not have one)")
+		// Send a notice that there's no profile picture
+		content := &event.MessageEventContent{
+			MsgType: event.MsgNotice,
+			Body:    fmt.Sprintf("📷 %s has no profile picture", contactName),
+		}
+		if err := wa.sendMatrixMessage(ctx, portal.MXID, content); err != nil {
+			log.Err(err).Msg("Failed to send no-picture notice to Matrix")
+		}
 		return
 	}
 	if pictureInfo == nil {
-		log.Warn().Msg("Profile picture info is nil")
+		log.Debug().Msg("Profile picture info is nil (user has no picture)")
+		content := &event.MessageEventContent{
+			MsgType: event.MsgNotice,
+			Body:    fmt.Sprintf("📷 %s has no profile picture", contactName),
+		}
+		if err := wa.sendMatrixMessage(ctx, portal.MXID, content); err != nil {
+			log.Err(err).Msg("Failed to send no-picture notice to Matrix")
+		}
 		return
 	}
 
@@ -390,12 +398,8 @@ func (wa *WhatsAppClient) sendMatrixPictureUpdateNotice(ctx context.Context, evt
 		return
 	}
 
-	// a file name is necessary to display in the matrix client correctly
-	fileName := fmt.Sprintf("new_profile_picture.jpg")
-	// Get image dimensions for proper Matrix display
+	// Get image dimensions
 	width, height := cocoGetImageDimensions(pictureBytes)
-	// this is a message that is used as the caption for the picture
-	noticeText := fmt.Sprintf("📷 %s updated their profile picture", contactName)
 
 	// Upload to Matrix
 	contentUri, _, err := wa.Main.Bridge.Matrix.BotIntent().UploadMedia(ctx, "", pictureBytes, "profile_picture.jpg", "image/jpeg")
@@ -404,7 +408,10 @@ func (wa *WhatsAppClient) sendMatrixPictureUpdateNotice(ctx context.Context, evt
 		return
 	}
 
-	// send image to chat
+	// Build the message
+	fileName := "current_profile_picture.jpg"
+	noticeText := fmt.Sprintf("📷 %s's current profile picture", contactName)
+
 	content := &event.MessageEventContent{
 		MsgType:  event.MsgImage,
 		Body:     noticeText,
@@ -419,13 +426,30 @@ func (wa *WhatsAppClient) sendMatrixPictureUpdateNotice(ctx context.Context, evt
 	}
 
 	if err := wa.sendMatrixMessage(ctx, portal.MXID, content); err != nil {
-		log.Err(err).Msg("Failed to send picture update notice to Matrix")
+		log.Err(err).Msg("Failed to send current picture to Matrix")
 	} else {
 		log.Info().
+			Str("contact", contactName).
 			Int("width", width).
 			Int("height", height).
-			Msg("Sent profile picture update with image")
+			Msg("Sent current profile picture to Matrix")
 	}
+
+	go wa.syncGhost(jid, "profile picture event", &pictureInfo.ID)
+}
+
+// handleContactSaved handles when a contact is saved on the phone.
+// This sends their current profile picture to the chat.
+func (wa *WhatsAppClient) handleContactSaved(ctx context.Context, evt *events.Contact) {
+	log := wa.UserLogin.Log.With().
+		Str("action", "coco_contact_saved").
+		Stringer("jid", evt.JID).
+		Logger()
+
+	log.Info().Msg("Contact saved - fetching current profile picture")
+
+	// Send the current profile picture
+	go wa.sendMatrixCurrentProfilePicture(ctx, evt.JID, "contact_saved")
 }
 
 // cocoTruncateString truncates a string to maxLen characters and adds "..." if truncated

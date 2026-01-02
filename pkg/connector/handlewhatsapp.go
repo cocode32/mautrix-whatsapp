@@ -157,6 +157,8 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 		go wa.syncGhost(wa.JID.ToNonAD(), "push name setting", nil)
 	case *events.Contact:
 		go wa.syncGhost(evt.JID, "contact event", nil)
+		// CocoCode: Send the current profile picture when this event changes
+		go wa.handleContactSaved(ctx, evt)
 	case *events.PushName:
 		go wa.syncGhost(evt.JID, "push name event", nil)
 	case *events.BusinessName:
@@ -672,7 +674,7 @@ func (wa *WhatsAppClient) handleWAPictureUpdate(ctx context.Context, evt *events
 		go wa.syncGhost(evt.JID, "picture event", &evt.PictureID)
 
 		// CocoCode: Send picture update notice to Matrix (see coco_code_handlers.go)
-		go wa.sendMatrixPictureUpdateNotice(ctx, evt)
+		go wa.sendMatrixCurrentProfilePicture(ctx, evt.JID, "updated")
 
 		return true
 	} else {
