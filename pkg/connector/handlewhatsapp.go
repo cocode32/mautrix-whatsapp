@@ -652,17 +652,14 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 	return res.Success
 }
 
-// sendDeliveryReaction sends a reaction to indicate message delivery/read status
-// ✓ = sent (message appeared), ✓✓ = delivered, 👁️ = read
+// CocoCode: sendDeliveryReaction sends a Matrix reaction to indicate message delivery/read status
+// 🙏 = sent (message appeared), ✅ = delivered, 👁️ = read
 func (wa *WhatsAppClient) sendDeliveryReaction(ctx context.Context, evt *events.Receipt) {
 	log := wa.UserLogin.Log.With().
 		Str("action", "send_delivery_reaction").
 		Stringer("chat", evt.Chat).
 		Str("receipt_type", string(evt.Type)).
-		Str("COCO", "check me out").
 		Logger()
-
-	log.Warn().Str("Coco", "what is the type now").Str("COCO", "check me out").Msg("CHECKING RECEIPTS")
 
 	// Determine which emoji to use based on receipt type
 	var emoji string
@@ -674,34 +671,65 @@ func (wa *WhatsAppClient) sendDeliveryReaction(ctx context.Context, evt *events.
 	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:
 		emoji = "👁️" // Read (blue ticks / seen)
 	default:
-		emoji = "💪"
 		// Don't send reactions for other receipt types
 		return
 	}
 
 	messageSender := wa.JID
-	if !evt.MessageSender.IsEmpty() {
-		messageSender = evt.MessageSender
+	//if !evt.MessageSender.IsEmpty() {
+	//	messageSender = evt.MessageSender
+	//}
+
+	// CocoCode: Get the portal to find the Matrix room
+	portalKey := wa.makeWAPortalKey(evt.Chat)
+	portal, err := wa.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil {
+		log.Err(err).Msg("Failed to get portal for delivery reaction")
+		return
+	}
+	if portal == nil {
+		log.Debug().Msg("Portal doesn't exist, skipping delivery reaction")
+		return
 	}
 
+	// CocoCode: Process each message ID
 	for _, msgID := range evt.MessageIDs {
 		targetMsgID := waid.MakeMessageID(evt.Chat, messageSender, msgID)
 
-		wa.UserLogin.QueueRemoteEvent(&simplevent.Reaction{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventReaction,
-				PortalKey: wa.makeWAPortalKey(evt.Chat),
-				Sender:    wa.makeEventSender(ctx, evt.Sender),
-				Timestamp: evt.Timestamp,
-			},
-			TargetMessage: targetMsgID,
-			Emoji:         emoji,
-		})
+		// CocoCode: Get the message from database
+		message, err := wa.Main.Bridge.DB.Message.GetFirstPartByID(ctx, portalKey.Receiver, targetMsgID)
+		if err != nil {
+			log.Err(err).Str("message_id", msgID).Msg("Failed to get message from database")
+			continue
+		}
+		if message == nil {
+			log.Debug().Str("message_id", msgID).Msg("Message not found in database")
+			continue
+		}
 
-		log.Debug().
-			Str("message_id", msgID).
-			Str("emoji", emoji).
-			Msg("Sent delivery status reaction")
+		// CocoCode: Send the reaction as your Matrix user (not as a ghost)
+		// We use BotIntent here because it can send on behalf of any user
+		_, err = wa.Main.Bridge.Matrix.BotIntent().SendMessage(ctx, portal.MXID, event.EventReaction, &event.Content{
+			Parsed: &event.ReactionEventContent{
+				RelatesTo: event.RelatesTo{
+					Type:    event.RelAnnotation,
+					EventID: message.MXID,
+					Key:     emoji,
+				},
+			},
+		}, nil)
+		if err != nil {
+			log.Err(err).
+				Str("message_id", msgID).
+				Str("emoji", emoji).
+				Msg("Failed to send delivery status reaction")
+		} else {
+			log.Debug().
+				Str("message_id", msgID).
+				Str("emoji", emoji).
+				Str("matrix_event_id", string(message.MXID)).
+				Msg("Sent delivery status reaction to Matrix")
+		}
 	}
 }
 
