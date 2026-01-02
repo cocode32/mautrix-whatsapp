@@ -19,15 +19,12 @@ package connector
 import (
 	"context"
 	"fmt"
-	"io"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/ptr"
-	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
@@ -351,14 +348,13 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 		return
 	}
 
-	// CocoCode Custom Handling
-	// CocoCode: Intercept revoke messages - send a notice instead of deleting
-	if parsedMessageType == "revoke" {
-		return wa.handleWAMessageRevoke(ctx, evt)
+	// CocoCode: Intercept revoke/edit messages - send local Matrix notices instead of remote events
+	// See coco_code_handlers.go for implementation details
+	if wa.ShouldInterceptRevoke(parsedMessageType) {
+		return wa.handleMatrixMessageRevoke(ctx, evt)
 	}
-	// CocoCode: Intercept edit messages - send a reply with new content instead of replacing
-	if parsedMessageType == "edit" {
-		return wa.handleWAMessageEdit(ctx, evt)
+	if wa.ShouldInterceptEdit(parsedMessageType) {
+		return wa.handleMatrixMessageEdit(ctx, evt)
 	}
 
 	if encReact := evt.Message.GetEncReactionMessage(); encReact != nil {
@@ -402,186 +398,6 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 	return res.Success
 }
 
-// handleWAMessageRevoke handles message revoke events by sending a notice
-// instead of deleting the message. This preserves the original message and
-// adds a reply indicating it was revoked.
-func (wa *WhatsAppClient) handleWAMessageRevoke(ctx context.Context, evt *events.Message) bool {
-	protocolMsg := evt.Message.GetProtocolMessage()
-	if protocolMsg == nil || protocolMsg.GetKey() == nil {
-		return true
-	}
-
-	revokedKey := protocolMsg.GetKey()
-	revokedMsgID := revokedKey.GetID()
-	senderJID := types.JID{
-		User:   revokedKey.GetRemoteJID(),
-		Server: types.DefaultUserServer,
-	}
-	if revokedKey.GetFromMe() {
-		senderJID = evt.Info.Sender
-	}
-
-	// Determine who revoked the message
-	var revokerName string
-	if evt.Info.IsFromMe {
-		revokerName = "You"
-	} else {
-		revokerName = evt.Info.PushName
-		if revokerName == "" {
-			revokerName = evt.Info.Sender.User
-		}
-	}
-
-	wa.UserLogin.Log.Info().
-		Str("revoked_message_id", revokedMsgID).
-		Str("revoker", revokerName).
-		Stringer("chat", evt.Info.Chat).
-		Msg("Message was revoked - sending notice instead of deleting")
-
-	// Create a notice message that will be sent as a reply
-	noticeText := fmt.Sprintf("⚠️ %s revoked a message", revokerName)
-
-	// Queue a simple message event with the revoke notice
-	// We use the revoke event's info but send it as a text notice
-	return wa.UserLogin.QueueRemoteEvent(&simplevent.Message[*waE2E.Message]{
-		EventMeta: simplevent.EventMeta{
-			Type: bridgev2.RemoteEventMessage,
-			LogContext: func(c zerolog.Context) zerolog.Context {
-				return c.
-					Str("revoked_message_id", revokedMsgID).
-					Str("revoker", revokerName)
-			},
-			PortalKey:    wa.makeWAPortalKey(evt.Info.Chat),
-			Sender:       wa.makeEventSender(ctx, evt.Info.Sender),
-			CreatePortal: false,
-			Timestamp:    evt.Info.Timestamp,
-		},
-		ID:            networkid.MessageID(evt.Info.ID),
-		TargetMessage: waid.MakeMessageID(evt.Info.Chat, senderJID, revokedMsgID),
-		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *waE2E.Message) (*bridgev2.ConvertedMessage, error) {
-			return &bridgev2.ConvertedMessage{
-				Parts: []*bridgev2.ConvertedMessagePart{{
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType: event.MsgNotice,
-						Body:    noticeText,
-					},
-				}},
-				ReplyTo: &networkid.MessageOptionalPartID{
-					MessageID: waid.MakeMessageID(evt.Info.Chat, senderJID, revokedMsgID),
-				},
-			}, nil
-		},
-		Data: evt.Message,
-	}).Success
-}
-
-// handleWAMessageEdit handles message edit events by sending a reply with the
-// new content instead of replacing the original message inline. This preserves
-// the original message and shows what it was edited to.
-func (wa *WhatsAppClient) handleWAMessageEdit(ctx context.Context, evt *events.Message) bool {
-	protocolMsg := evt.Message.GetProtocolMessage()
-	if protocolMsg == nil || protocolMsg.GetKey() == nil {
-		return true
-	}
-
-	editedKey := protocolMsg.GetKey()
-	editedMsgID := editedKey.GetID()
-	editedMessage := protocolMsg.GetEditedMessage()
-
-	senderJID := types.JID{
-		User:   editedKey.GetRemoteJID(),
-		Server: types.DefaultUserServer,
-	}
-	if editedKey.GetFromMe() {
-		senderJID = evt.Info.Sender
-	}
-
-	// Determine who edited the message
-	var editorName string
-	if evt.Info.IsFromMe {
-		editorName = "You"
-	} else {
-		editorName = evt.Info.PushName
-		if editorName == "" {
-			editorName = evt.Info.Sender.User
-		}
-	}
-
-	// Extract the new message content
-	var newContent string
-	if editedMessage != nil {
-		if editedMessage.GetConversation() != "" {
-			newContent = editedMessage.GetConversation()
-		} else if editedMessage.GetExtendedTextMessage() != nil {
-			newContent = editedMessage.GetExtendedTextMessage().GetText()
-		} else if editedMessage.GetImageMessage() != nil {
-			newContent = "[Image] " + editedMessage.GetImageMessage().GetCaption()
-		} else if editedMessage.GetVideoMessage() != nil {
-			newContent = "[Video] " + editedMessage.GetVideoMessage().GetCaption()
-		} else if editedMessage.GetDocumentMessage() != nil {
-			newContent = "[Document] " + editedMessage.GetDocumentMessage().GetCaption()
-		} else {
-			newContent = "[Edited media message]"
-		}
-	}
-
-	if newContent == "" {
-		newContent = "[Empty or unsupported edit]"
-	}
-
-	wa.UserLogin.Log.Info().
-		Str("edited_message_id", editedMsgID).
-		Str("editor", editorName).
-		Stringer("chat", evt.Info.Chat).
-		Str("new_content_preview", truncateString(newContent, 50)).
-		Msg("Message was edited - sending notice with new content instead of replacing")
-
-	// Create a notice message that will be sent as a reply
-	noticeText := fmt.Sprintf("✏️ %s edited this message:\n\n%s", editorName, newContent)
-
-	// Queue a simple message event with the edit notice
-	return wa.UserLogin.QueueRemoteEvent(&simplevent.Message[*waE2E.Message]{
-		EventMeta: simplevent.EventMeta{
-			Type: bridgev2.RemoteEventMessage,
-			LogContext: func(c zerolog.Context) zerolog.Context {
-				return c.
-					Str("edited_message_id", editedMsgID).
-					Str("editor", editorName)
-			},
-			PortalKey:    wa.makeWAPortalKey(evt.Info.Chat),
-			Sender:       wa.makeEventSender(ctx, evt.Info.Sender),
-			CreatePortal: false,
-			Timestamp:    evt.Info.Timestamp,
-		},
-		ID:            networkid.MessageID(evt.Info.ID),
-		TargetMessage: waid.MakeMessageID(evt.Info.Chat, senderJID, editedMsgID),
-		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *waE2E.Message) (*bridgev2.ConvertedMessage, error) {
-			return &bridgev2.ConvertedMessage{
-				Parts: []*bridgev2.ConvertedMessagePart{{
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType: event.MsgNotice,
-						Body:    noticeText,
-					},
-				}},
-				ReplyTo: &networkid.MessageOptionalPartID{
-					MessageID: waid.MakeMessageID(evt.Info.Chat, senderJID, editedMsgID),
-				},
-			}, nil
-		},
-		Data: evt.Message,
-	}).Success
-}
-
-// truncateString truncates a string to maxLen characters and adds "..." if truncated
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
-}
-
 func (wa *WhatsAppClient) handleWAUndecryptableMessage(ctx context.Context, evt *events.UndecryptableMessage) bool {
 	wa.rerouteWAMessage(ctx, "undecryptable message", &evt.Info.MessageSource, evt.Info.ID)
 	wa.UserLogin.Log.Debug().
@@ -612,9 +428,8 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 		wa.phoneSeen(evt.Timestamp)
 	}
 
-	// CocoCode Custom Handling
-	// CocoCode: Send reaction-based delivery status
-	go wa.sendDeliveryReaction(ctx, evt)
+	// CocoCode: Send reaction-based delivery status (see coco_code_handlers.go)
+	go wa.sendMatrixDeliveryReaction(ctx, evt)
 
 	var evtType bridgev2.RemoteEventType
 	switch evt.Type {
@@ -650,87 +465,6 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 		Targets: targets,
 	})
 	return res.Success
-}
-
-// CocoCode: sendDeliveryReaction sends a Matrix reaction to indicate message delivery/read status
-// 🙏 = sent (message appeared), ✅ = delivered, 👁️ = read
-func (wa *WhatsAppClient) sendDeliveryReaction(ctx context.Context, evt *events.Receipt) {
-	log := wa.UserLogin.Log.With().
-		Str("action", "send_delivery_reaction").
-		Stringer("chat", evt.Chat).
-		Str("receipt_type", string(evt.Type)).
-		Logger()
-
-	// Determine which emoji to use based on receipt type
-	var emoji string
-	switch evt.Type {
-	case types.ReceiptTypeSender:
-		emoji = "🙏" // Sent - 1 tick
-	case types.ReceiptTypeDelivered:
-		emoji = "✅" // Delivered (two ticks)
-	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:
-		emoji = "👁️" // Read (blue ticks / seen)
-	default:
-		// Don't send reactions for other receipt types
-		return
-	}
-
-	messageSender := wa.JID
-	//if !evt.MessageSender.IsEmpty() {
-	//	messageSender = evt.MessageSender
-	//}
-
-	// CocoCode: Get the portal to find the Matrix room
-	portalKey := wa.makeWAPortalKey(evt.Chat)
-	portal, err := wa.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-	if err != nil {
-		log.Err(err).Msg("Failed to get portal for delivery reaction")
-		return
-	}
-	if portal == nil {
-		log.Debug().Msg("Portal doesn't exist, skipping delivery reaction")
-		return
-	}
-
-	// CocoCode: Process each message ID
-	for _, msgID := range evt.MessageIDs {
-		targetMsgID := waid.MakeMessageID(evt.Chat, messageSender, msgID)
-
-		// CocoCode: Get the message from database
-		message, err := wa.Main.Bridge.DB.Message.GetFirstPartByID(ctx, portalKey.Receiver, targetMsgID)
-		if err != nil {
-			log.Err(err).Str("message_id", msgID).Msg("Failed to get message from database")
-			continue
-		}
-		if message == nil {
-			log.Debug().Str("message_id", msgID).Msg("Message not found in database")
-			continue
-		}
-
-		// CocoCode: Send the reaction as your Matrix user (not as a ghost)
-		// We use BotIntent here because it can send on behalf of any user
-		_, err = wa.Main.Bridge.Matrix.BotIntent().SendMessage(ctx, portal.MXID, event.EventReaction, &event.Content{
-			Parsed: &event.ReactionEventContent{
-				RelatesTo: event.RelatesTo{
-					Type:    event.RelAnnotation,
-					EventID: message.MXID,
-					Key:     emoji,
-				},
-			},
-		}, nil)
-		if err != nil {
-			log.Err(err).
-				Str("message_id", msgID).
-				Str("emoji", emoji).
-				Msg("Failed to send delivery status reaction")
-		} else {
-			log.Debug().
-				Str("message_id", msgID).
-				Str("emoji", emoji).
-				Str("matrix_event_id", string(message.MXID)).
-				Msg("Sent delivery status reaction to Matrix")
-		}
-	}
 }
 
 func (wa *WhatsAppClient) handleWAChatPresence(ctx context.Context, evt *events.ChatPresence) {
@@ -937,9 +671,8 @@ func (wa *WhatsAppClient) handleWAPictureUpdate(ctx context.Context, evt *events
 	if evt.JID.Server == types.DefaultUserServer || evt.JID.Server == types.HiddenUserServer || evt.JID.Server == types.BotServer {
 		go wa.syncGhost(evt.JID, "picture event", &evt.PictureID)
 
-		// CocoCode Custom Handling
-		// CocoCode: Also send the profile picture as a message to the chat
-		go wa.sendPictureUpdateNotice(ctx, evt)
+		// CocoCode: Send picture update notice to Matrix (see coco_code_handlers.go)
+		go wa.sendMatrixPictureUpdateNotice(ctx, evt)
 
 		return true
 	} else {
@@ -968,144 +701,6 @@ func (wa *WhatsAppClient) handleWAPictureUpdate(ctx context.Context, evt *events
 			},
 		}).Success
 	}
-}
-
-// CocoCode: sendPictureUpdateNotice sends the profile picture as a message to the chat
-// so you can see what the picture was changed to (or that it was removed)
-func (wa *WhatsAppClient) sendPictureUpdateNotice(ctx context.Context, evt *events.Picture) {
-	log := wa.UserLogin.Log.With().
-		Str("action", "send_picture_update_notice").
-		Stringer("jid", evt.JID).
-		Str("picture_id", evt.PictureID).
-		Bool("removed", evt.Remove).
-		Logger()
-
-	// CocoCode: Normalize JID to phone number for portal lookup
-	// If this is a LID, convert it to the phone number JID so we use the correct portal
-	portalJID := evt.JID
-	if evt.JID.Server == types.HiddenUserServer {
-		pn, err := wa.GetStore().LIDs.GetPNForLID(ctx, evt.JID)
-		if err != nil {
-			log.Err(err).Msg("Failed to get phone number for LID in picture notice")
-			// Fall back to using the LID
-		} else if !pn.IsEmpty() {
-			portalJID = pn
-			log.Debug().
-				Stringer("original_jid", evt.JID).
-				Stringer("normalized_jid", portalJID).
-				Msg("Normalized LID to phone number for portal lookup")
-		}
-	}
-
-	// Get the contact name
-	userInfo, _ := wa.getUserInfo(ctx, evt.JID, false)
-	contactName := userInfo.Name
-
-	if evt.Remove {
-		// Picture was removed - send a text notice
-		noticeText := fmt.Sprintf("📷 %s removed their profile picture", contactName)
-
-		wa.UserLogin.QueueRemoteEvent(&simplevent.Message[any]{
-			EventMeta: simplevent.EventMeta{
-				Type: bridgev2.RemoteEventMessage,
-				LogContext: func(c zerolog.Context) zerolog.Context {
-					return c.Str("picture_notice", "removed")
-				},
-				PortalKey:    wa.makeWAPortalKey(portalJID), // CocoCode: Use normalized JID
-				Sender:       wa.makeEventSender(ctx, evt.JID),
-				CreatePortal: false, // CocoCode: Don't create new portal, should exist
-				Timestamp:    evt.Timestamp,
-			},
-			ID: networkid.MessageID(fmt.Sprintf("picture_remove_%s_%d", evt.JID.String(), evt.Timestamp.Unix())),
-			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data any) (*bridgev2.ConvertedMessage, error) {
-				return &bridgev2.ConvertedMessage{
-					Parts: []*bridgev2.ConvertedMessagePart{{
-						Type: event.EventMessage,
-						Content: &event.MessageEventContent{
-							MsgType: event.MsgNotice,
-							Body:    noticeText,
-						},
-					}},
-				}, nil
-			},
-		})
-		log.Info().Msg("Sent profile picture removal notice")
-	} else {
-		// Picture was updated - fetch and send the full picture
-		pictureInfo, err := wa.Client.GetProfilePictureInfo(ctx, evt.JID, &whatsmeow.GetProfilePictureParams{
-			Preview: false, // Get full resolution
-		})
-		if err != nil {
-			log.Err(err).Msg("Failed to get profile picture info")
-			return
-		}
-		if pictureInfo == nil {
-			log.Warn().Msg("Profile picture info is nil")
-			return
-		}
-
-		// Download the picture
-		pictureBytes, err := wa.downloadProfilePicture(ctx, pictureInfo.URL)
-		if err != nil {
-			log.Err(err).Msg("Failed to download profile picture")
-			return
-		}
-
-		noticeText := fmt.Sprintf("📷 %s updated their profile picture", contactName) // CocoCode: Removed debug text
-
-		wa.UserLogin.QueueRemoteEvent(&simplevent.Message[[]byte]{
-			EventMeta: simplevent.EventMeta{
-				Type: bridgev2.RemoteEventMessage,
-				LogContext: func(c zerolog.Context) zerolog.Context {
-					return c.Str("picture_notice", "updated")
-				},
-				PortalKey:    wa.makeWAPortalKey(portalJID), // CocoCode: Use normalized JID
-				Sender:       wa.makeEventSender(ctx, evt.JID),
-				CreatePortal: false, // CocoCode: Don't create new portal, should exist
-				Timestamp:    evt.Timestamp,
-			},
-			ID: networkid.MessageID(fmt.Sprintf("picture_update_%s_%d", evt.JID.String(), evt.Timestamp.Unix())),
-			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data []byte) (*bridgev2.ConvertedMessage, error) {
-				// Upload the image to Matrix
-				contentUri, _, err := intent.UploadMedia(ctx, "", data, "profile_picture.jpg", "image/jpeg")
-				if err != nil {
-					return nil, fmt.Errorf("failed to upload profile picture: %w", err)
-				}
-
-				return &bridgev2.ConvertedMessage{
-					Parts: []*bridgev2.ConvertedMessagePart{{
-						Type: event.EventMessage,
-						Content: &event.MessageEventContent{
-							MsgType: event.MsgImage,
-							Body:    noticeText,
-							URL:     contentUri,
-							Info: &event.FileInfo{
-								MimeType: "image/jpeg",
-								Size:     len(data),
-							},
-						},
-					}},
-				}, nil
-			},
-			Data: pictureBytes,
-		})
-		log.Info().Msg("Sent profile picture update with image")
-	}
-}
-
-// downloadProfilePicture downloads a profile picture from a URL
-func (wa *WhatsAppClient) downloadProfilePicture(ctx context.Context, url string) ([]byte, error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	return io.ReadAll(resp.Body)
 }
 
 func (wa *WhatsAppClient) handleWAGroupInfoChange(ctx context.Context, evt *events.GroupInfo) bool {
