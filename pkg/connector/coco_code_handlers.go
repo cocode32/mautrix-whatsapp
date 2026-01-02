@@ -345,7 +345,7 @@ func (wa *WhatsAppClient) sendMatrixPictureUpdateNotice(ctx context.Context, evt
 
 	// Get the contact name
 	userInfo, _ := wa.getUserInfo(ctx, evt.JID, false)
-	contactName := userInfo.Name
+	contactName := *userInfo.Name
 
 	if evt.Remove {
 		// Picture was removed - send a text notice
