@@ -241,11 +241,11 @@ func (wa *WhatsAppClient) sendMatrixDeliveryReaction(ctx context.Context, evt *e
 	var emoji string
 	switch evt.Type {
 	case types.ReceiptTypeSender:
-		emoji = "🙏" // Sent - 1 tick
+		emoji = "📭" // Sent - 1 tick
 	case types.ReceiptTypeDelivered:
-		emoji = "✅" // Delivered (two ticks)
+		emoji = "📩" // Delivered (two ticks)
 	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:
-		emoji = "👁️" // Read (blue ticks / seen)
+		emoji = "👀" // Read (blue ticks / seen)
 	default:
 		// Don't send reactions for other receipt types
 		return
