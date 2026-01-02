@@ -11,8 +11,12 @@
 package connector
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	_ "image/jpeg" // Register JPEG decoder
+	_ "image/png"  // Register PNG decoder
 	"io"
 	"net/http"
 
@@ -20,11 +24,35 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
 
-// handleMatrixMessageRevoke sends a notice to Matrix when a message is revoked
+// sendMatrixMessage is a helper that sends a message to a Matrix room using BotIntent.
+// This ensures all custom messages are local-only and never go back to WhatsApp.
+func (wa *WhatsAppClient) sendMatrixMessage(ctx context.Context, roomID id.RoomID, content *event.MessageEventContent) error {
+	_, err := wa.Main.Bridge.Matrix.BotIntent().SendMessage(ctx, roomID, event.EventMessage, &event.Content{
+		Parsed: content,
+	}, nil)
+	return err
+}
+
+// sendMatrixReaction is a helper that sends a reaction to a Matrix message using BotIntent.
+func (wa *WhatsAppClient) sendMatrixReaction(ctx context.Context, roomID id.RoomID, targetEventID id.EventID, emoji string) error {
+	_, err := wa.Main.Bridge.Matrix.BotIntent().SendMessage(ctx, roomID, event.EventReaction, &event.Content{
+		Parsed: &event.ReactionEventContent{
+			RelatesTo: event.RelatesTo{
+				Type:    event.RelAnnotation,
+				EventID: targetEventID,
+				Key:     emoji,
+			},
+		},
+	}, nil)
+	return err
+}
+
+// handleMatrixMessageRevoke sends a notice to Matrix when a message is revoked.
 // This preserves the original message and adds a reply indicating it was revoked.
 // Uses direct Matrix API - this is a LOCAL event only, never goes to WhatsApp.
 func (wa *WhatsAppClient) handleMatrixMessageRevoke(ctx context.Context, evt *events.Message) bool {
@@ -64,12 +92,12 @@ func (wa *WhatsAppClient) handleMatrixMessageRevoke(ctx context.Context, evt *ev
 
 	log.Info().Str("revoker", revokerName).Msg("Message was revoked - sending local Matrix notice")
 
-	// Get the portal to find the Matrix room
+	// Get the portal
 	portalKey := wa.makeWAPortalKey(evt.Info.Chat)
 	portal, err := wa.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 	if err != nil {
 		log.Err(err).Msg("Failed to get portal for revoke notice")
-		return true // Don't block, just skip our custom handling
+		return true
 	}
 	if portal == nil {
 		log.Debug().Msg("Portal doesn't exist, skipping revoke notice")
@@ -81,7 +109,6 @@ func (wa *WhatsAppClient) handleMatrixMessageRevoke(ctx context.Context, evt *ev
 	message, err := wa.Main.Bridge.DB.Message.GetFirstPartByID(ctx, portalKey.Receiver, targetMsgID)
 	if err != nil {
 		log.Err(err).Msg("Failed to get original message from database")
-		// Still send the notice, just without the reply
 	}
 
 	// Build the notice content
@@ -100,11 +127,7 @@ func (wa *WhatsAppClient) handleMatrixMessageRevoke(ctx context.Context, evt *ev
 		}
 	}
 
-	// Send directly to Matrix using BotIntent (local only, never to WhatsApp)
-	_, err = wa.Main.Bridge.Matrix.BotIntent().SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-		Parsed: content,
-	}, nil)
-	if err != nil {
+	if err := wa.sendMatrixMessage(ctx, portal.MXID, content); err != nil {
 		log.Err(err).Msg("Failed to send revoke notice to Matrix")
 	} else {
 		log.Debug().Msg("Sent revoke notice to Matrix")
@@ -113,7 +136,7 @@ func (wa *WhatsAppClient) handleMatrixMessageRevoke(ctx context.Context, evt *ev
 	return true
 }
 
-// handleMatrixMessageEdit sends a notice to Matrix when a message is edited
+// handleMatrixMessageEdit sends a notice to Matrix when a message is edited.
 // This preserves the original message and shows what it was edited to as a reply.
 // Uses direct Matrix API - this is a LOCAL event only, never goes to WhatsApp.
 func (wa *WhatsAppClient) handleMatrixMessageEdit(ctx context.Context, evt *events.Message) bool {
@@ -179,7 +202,7 @@ func (wa *WhatsAppClient) handleMatrixMessageEdit(ctx context.Context, evt *even
 		Str("new_content_preview", cocoTruncateString(newContent, 50)).
 		Msg("Message was edited - sending local Matrix notice")
 
-	// Get the portal to find the Matrix room
+	// Get the portal
 	portalKey := wa.makeWAPortalKey(evt.Info.Chat)
 	portal, err := wa.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 	if err != nil {
@@ -214,11 +237,7 @@ func (wa *WhatsAppClient) handleMatrixMessageEdit(ctx context.Context, evt *even
 		}
 	}
 
-	// Send directly to Matrix using BotIntent (local only, never to WhatsApp)
-	_, err = wa.Main.Bridge.Matrix.BotIntent().SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-		Parsed: content,
-	}, nil)
-	if err != nil {
+	if err := wa.sendMatrixMessage(ctx, portal.MXID, content); err != nil {
 		log.Err(err).Msg("Failed to send edit notice to Matrix")
 	} else {
 		log.Debug().Msg("Sent edit notice to Matrix")
@@ -227,8 +246,8 @@ func (wa *WhatsAppClient) handleMatrixMessageEdit(ctx context.Context, evt *even
 	return true
 }
 
-// sendMatrixDeliveryReaction sends a Matrix reaction to indicate message delivery/read status
-// Emoji mapping: 🙏 = sent, ✅ = delivered, 👁️ = read
+// sendMatrixDeliveryReaction sends a Matrix reaction to indicate message delivery/read status.
+// Emoji mapping: 📭 = sent, 📩 = delivered, 👀 = read
 // Uses direct Matrix API - this is a LOCAL event only, never goes to WhatsApp.
 func (wa *WhatsAppClient) sendMatrixDeliveryReaction(ctx context.Context, evt *events.Receipt) {
 	log := wa.UserLogin.Log.With().
@@ -241,17 +260,16 @@ func (wa *WhatsAppClient) sendMatrixDeliveryReaction(ctx context.Context, evt *e
 	var emoji string
 	switch evt.Type {
 	case types.ReceiptTypeSender:
-		emoji = "📭" // Sent - 1 tick
+		emoji = "📭" // Sent - mailbox with flag down
 	case types.ReceiptTypeDelivered:
-		emoji = "📩" // Delivered (two ticks)
+		emoji = "📩" // Delivered - envelope with arrow
 	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:
-		emoji = "👀" // Read (blue ticks / seen)
+		emoji = "👀" // Read - eyes
 	default:
-		// Don't send reactions for other receipt types
 		return
 	}
 
-	// Get the portal to find the Matrix room
+	// Get the portal
 	portalKey := wa.makeWAPortalKey(evt.Chat)
 	portal, err := wa.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 	if err != nil {
@@ -265,11 +283,9 @@ func (wa *WhatsAppClient) sendMatrixDeliveryReaction(ctx context.Context, evt *e
 
 	messageSender := wa.JID
 
-	// Process each message ID
 	for _, msgID := range evt.MessageIDs {
 		targetMsgID := waid.MakeMessageID(evt.Chat, messageSender, msgID)
 
-		// Get the message from database
 		message, err := wa.Main.Bridge.DB.Message.GetFirstPartByID(ctx, portalKey.Receiver, targetMsgID)
 		if err != nil {
 			log.Err(err).Str("message_id", msgID).Msg("Failed to get message from database")
@@ -280,17 +296,7 @@ func (wa *WhatsAppClient) sendMatrixDeliveryReaction(ctx context.Context, evt *e
 			continue
 		}
 
-		// Send directly to Matrix using BotIntent (local only, never to WhatsApp)
-		_, err = wa.Main.Bridge.Matrix.BotIntent().SendMessage(ctx, portal.MXID, event.EventReaction, &event.Content{
-			Parsed: &event.ReactionEventContent{
-				RelatesTo: event.RelatesTo{
-					Type:    event.RelAnnotation,
-					EventID: message.MXID,
-					Key:     emoji,
-				},
-			},
-		}, nil)
-		if err != nil {
+		if err := wa.sendMatrixReaction(ctx, portal.MXID, message.MXID, emoji); err != nil {
 			log.Err(err).
 				Str("message_id", msgID).
 				Str("emoji", emoji).
@@ -305,8 +311,9 @@ func (wa *WhatsAppClient) sendMatrixDeliveryReaction(ctx context.Context, evt *e
 	}
 }
 
-// sendMatrixPictureUpdateNotice sends a profile picture update notice to Matrix
-// If picture was updated, includes the image. If removed, sends text notice.
+// sendMatrixPictureUpdateNotice sends a profile picture update notice to Matrix.
+// If picture was updated, includes the image with proper dimensions for inline display.
+// If removed, sends text notice.
 // Uses direct Matrix API - this is a LOCAL event only, never goes to WhatsApp.
 func (wa *WhatsAppClient) sendMatrixPictureUpdateNotice(ctx context.Context, evt *events.Picture) {
 	log := wa.UserLogin.Log.With().
@@ -331,7 +338,7 @@ func (wa *WhatsAppClient) sendMatrixPictureUpdateNotice(ctx context.Context, evt
 		}
 	}
 
-	// Get the portal to find the Matrix room
+	// Get the portal
 	portalKey := wa.makeWAPortalKey(portalJID)
 	portal, err := wa.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 	if err != nil {
@@ -355,61 +362,69 @@ func (wa *WhatsAppClient) sendMatrixPictureUpdateNotice(ctx context.Context, evt
 			Body:    noticeText,
 		}
 
-		_, err = wa.Main.Bridge.Matrix.BotIntent().SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-			Parsed: content,
-		}, nil)
-		if err != nil {
+		if err := wa.sendMatrixMessage(ctx, portal.MXID, content); err != nil {
 			log.Err(err).Msg("Failed to send picture removal notice to Matrix")
 		} else {
 			log.Info().Msg("Sent profile picture removal notice")
 		}
+		return
+	}
+
+	// Picture was updated - fetch and send the full picture
+	pictureInfo, err := wa.Client.GetProfilePictureInfo(ctx, evt.JID, &whatsmeow.GetProfilePictureParams{
+		Preview: false, // Get full resolution
+	})
+	if err != nil {
+		log.Err(err).Msg("Failed to get profile picture info")
+		return
+	}
+	if pictureInfo == nil {
+		log.Warn().Msg("Profile picture info is nil")
+		return
+	}
+
+	// Download the picture
+	pictureBytes, err := cocoDownloadProfilePicture(ctx, pictureInfo.URL)
+	if err != nil {
+		log.Err(err).Msg("Failed to download profile picture")
+		return
+	}
+
+	// a file name is necessary to display in the matrix client correctly
+	fileName := fmt.Sprintf("profile.jpg")
+	// Get image dimensions for proper Matrix display
+	width, height := cocoGetImageDimensions(pictureBytes)
+	// this is a message that is used as the caption for the picture
+	noticeText := fmt.Sprintf("📷 %s updated their profile picture", contactName)
+
+	// Upload to Matrix
+	contentUri, _, err := wa.Main.Bridge.Matrix.BotIntent().UploadMedia(ctx, "", pictureBytes, "profile_picture.jpg", "image/jpeg")
+	if err != nil {
+		log.Err(err).Msg("Failed to upload profile picture to Matrix")
+		return
+	}
+
+	// send image to chat
+	content := &event.MessageEventContent{
+		MsgType:  event.MsgImage,
+		Body:     noticeText,
+		URL:      contentUri,
+		FileName: fileName,
+		Info: &event.FileInfo{
+			MimeType: "image/jpeg",
+			Size:     len(pictureBytes),
+			Width:    width,
+			Height:   height,
+		},
+	}
+
+	if err := wa.sendMatrixMessage(ctx, portal.MXID, content); err != nil {
+		log.Err(err).Msg("Failed to send picture update notice to Matrix")
 	} else {
-		// Picture was updated - fetch and send the full picture
-		pictureInfo, err := wa.Client.GetProfilePictureInfo(ctx, evt.JID, &whatsmeow.GetProfilePictureParams{
-			Preview: false, // Get full resolution
-		})
-		if err != nil {
-			log.Err(err).Msg("Failed to get profile picture info")
-			return
-		}
-		if pictureInfo == nil {
-			log.Warn().Msg("Profile picture info is nil")
-			return
-		}
-
-		// Download the picture
-		pictureBytes, err := cocoDownloadProfilePicture(ctx, pictureInfo.URL)
-		if err != nil {
-			log.Err(err).Msg("Failed to download profile picture")
-			return
-		}
-
-		// Upload to Matrix
-		contentUri, _, err := wa.Main.Bridge.Matrix.BotIntent().UploadMedia(ctx, "", pictureBytes, "profile_picture.jpg", "image/jpeg")
-		if err != nil {
-			log.Err(err).Msg("Failed to upload profile picture to Matrix")
-			return
-		}
-
-		noticeText := fmt.Sprintf("📷 %s updated their profile picture", contactName)
-		content := &event.MessageEventContent{
-			MsgType: event.MsgImage,
-			Body:    noticeText,
-			URL:     contentUri,
-			Info: &event.FileInfo{
-				MimeType: "image/jpeg",
-				Size:     len(pictureBytes),
-			},
-		}
-
-		_, err = wa.Main.Bridge.Matrix.BotIntent().SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-			Parsed: content,
-		}, nil)
-		if err != nil {
-			log.Err(err).Msg("Failed to send picture update notice to Matrix")
-		} else {
-			log.Info().Msg("Sent profile picture update with image")
-		}
+		log.Info().
+			Int("width", width).
+			Int("height", height).
+			Msg("Sent profile picture update with image")
 	}
 }
 
@@ -441,14 +456,24 @@ func cocoDownloadProfilePicture(ctx context.Context, url string) ([]byte, error)
 	return io.ReadAll(resp.Body)
 }
 
+// cocoGetImageDimensions decodes image bytes to get width and height.
+// Returns (0, 0) if dimensions cannot be determined (image will still display, just without size hints).
+func cocoGetImageDimensions(data []byte) (width, height int) {
+	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return 0, 0
+	}
+	return config.Width, config.Height
+}
+
 // ShouldInterceptRevoke returns true if this is a revoke message that should be handled
-// by CocoCode custom logic instead of the default behavior
+// by custom logic instead of the default behavior
 func (wa *WhatsAppClient) ShouldInterceptRevoke(parsedMessageType string) bool {
 	return parsedMessageType == "revoke"
 }
 
 // ShouldInterceptEdit returns true if this is an edit message that should be handled
-// by CocoCode custom logic instead of the default behavior
+// by custom logic instead of the default behavior
 func (wa *WhatsAppClient) ShouldInterceptEdit(parsedMessageType string) bool {
 	return parsedMessageType == "edit"
 }
