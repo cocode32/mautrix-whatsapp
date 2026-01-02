@@ -611,6 +611,11 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 	if evt.IsFromMe && evt.Sender.Device == 0 {
 		wa.phoneSeen(evt.Timestamp)
 	}
+
+	// CocoCode Custom Handling
+	// CocoCode: Send reaction-based delivery status
+	go wa.sendDeliveryReaction(ctx, evt)
+
 	var evtType bridgev2.RemoteEventType
 	switch evt.Type {
 	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:
@@ -645,6 +650,59 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 		Targets: targets,
 	})
 	return res.Success
+}
+
+// sendDeliveryReaction sends a reaction to indicate message delivery/read status
+// ✓ = sent (message appeared), ✓✓ = delivered, 👁️ = read
+func (wa *WhatsAppClient) sendDeliveryReaction(ctx context.Context, evt *events.Receipt) {
+	log := wa.UserLogin.Log.With().
+		Str("action", "send_delivery_reaction").
+		Stringer("chat", evt.Chat).
+		Str("receipt_type", string(evt.Type)).
+		Str("COCO", "check me out").
+		Logger()
+
+	log.Warn().Str("Coco", "what is the type now").Str("COCO", "check me out").Msg("CHECKING RECEIPTS")
+
+	// Determine which emoji to use based on receipt type
+	var emoji string
+	switch evt.Type {
+	case types.ReceiptTypeSender:
+		emoji = "🙏" // Sent - 1 tick
+	case types.ReceiptTypeDelivered:
+		emoji = "✅" // Delivered (two ticks)
+	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:
+		emoji = "👁️" // Read (blue ticks / seen)
+	default:
+		emoji = "💪"
+		// Don't send reactions for other receipt types
+		return
+	}
+
+	messageSender := wa.JID
+	if !evt.MessageSender.IsEmpty() {
+		messageSender = evt.MessageSender
+	}
+
+	for _, msgID := range evt.MessageIDs {
+		targetMsgID := waid.MakeMessageID(evt.Chat, messageSender, msgID)
+
+		wa.UserLogin.QueueRemoteEvent(&simplevent.Reaction{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventReaction,
+				PortalKey: wa.makeWAPortalKey(evt.Chat),
+				Sender:    wa.makeEventSender(ctx, evt.Sender),
+				Timestamp: evt.Timestamp,
+			},
+			TargetMessage: targetMsgID,
+			Emoji:         emoji,
+		})
+
+		log.Debug().
+			Str("message_id", msgID).
+			Str("emoji", emoji).
+			Msg("Sent delivery status reaction")
+	}
 }
 
 func (wa *WhatsAppClient) handleWAChatPresence(ctx context.Context, evt *events.ChatPresence) {
