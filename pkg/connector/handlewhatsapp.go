@@ -157,6 +157,8 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 		go wa.syncGhost(wa.JID.ToNonAD(), "push name setting", nil)
 	case *events.Contact:
 		go wa.syncGhost(evt.JID, "contact event", nil)
+		// CocoCode: Send the current profile picture when this event changes
+		go wa.handleContactSaved(ctx, evt)
 	case *events.PushName:
 		go wa.syncGhost(evt.JID, "push name event", nil)
 	case *events.BusinessName:
@@ -347,6 +349,16 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 	if parsedMessageType == "ignore" || strings.HasPrefix(parsedMessageType, "unknown_protocol_") {
 		return
 	}
+
+	// CocoCode: Intercept revoke/edit messages - send local Matrix notices instead of remote events
+	// See coco_code_handlers.go for implementation details
+	if wa.ShouldInterceptRevoke(parsedMessageType) {
+		return wa.handleMatrixMessageRevoke(ctx, evt)
+	}
+	if wa.ShouldInterceptEdit(parsedMessageType) {
+		return wa.handleMatrixMessageEdit(ctx, evt)
+	}
+
 	if encReact := evt.Message.GetEncReactionMessage(); encReact != nil {
 		decrypted, err := wa.Client.DecryptReaction(ctx, evt)
 		if err != nil {
@@ -417,6 +429,10 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 	if evt.IsFromMe && evt.Sender.Device == 0 {
 		wa.phoneSeen(evt.Timestamp)
 	}
+
+	// CocoCode: Send reaction-based delivery status (see coco_code_handlers.go)
+	go wa.sendMatrixDeliveryReaction(ctx, evt)
+
 	var evtType bridgev2.RemoteEventType
 	switch evt.Type {
 	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:
@@ -656,6 +672,10 @@ func (wa *WhatsAppClient) syncGhost(jid types.JID, reason string, pictureID *str
 func (wa *WhatsAppClient) handleWAPictureUpdate(ctx context.Context, evt *events.Picture) bool {
 	if evt.JID.Server == types.DefaultUserServer || evt.JID.Server == types.HiddenUserServer || evt.JID.Server == types.BotServer {
 		go wa.syncGhost(evt.JID, "picture event", &evt.PictureID)
+
+		// CocoCode: Send picture update notice to Matrix (see coco_code_handlers.go)
+		go wa.sendMatrixCurrentProfilePicture(ctx, evt.JID, "updated")
+
 		return true
 	} else {
 		var changes bridgev2.ChatInfo
