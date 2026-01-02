@@ -19,12 +19,15 @@ package connector
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/ptr"
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
@@ -847,6 +850,11 @@ func (wa *WhatsAppClient) syncGhost(jid types.JID, reason string, pictureID *str
 func (wa *WhatsAppClient) handleWAPictureUpdate(ctx context.Context, evt *events.Picture) bool {
 	if evt.JID.Server == types.DefaultUserServer || evt.JID.Server == types.HiddenUserServer || evt.JID.Server == types.BotServer {
 		go wa.syncGhost(evt.JID, "picture event", &evt.PictureID)
+
+		// CocoCode Custom Handling
+		// CocoCode: Also send the profile picture as a message to the chat
+		go wa.sendPictureUpdateNotice(ctx, evt)
+
 		return true
 	} else {
 		var changes bridgev2.ChatInfo
@@ -874,6 +882,144 @@ func (wa *WhatsAppClient) handleWAPictureUpdate(ctx context.Context, evt *events
 			},
 		}).Success
 	}
+}
+
+// CocoCode: sendPictureUpdateNotice sends the profile picture as a message to the chat
+// so you can see what the picture was changed to (or that it was removed)
+func (wa *WhatsAppClient) sendPictureUpdateNotice(ctx context.Context, evt *events.Picture) {
+	log := wa.UserLogin.Log.With().
+		Str("action", "send_picture_update_notice").
+		Stringer("jid", evt.JID).
+		Str("picture_id", evt.PictureID).
+		Bool("removed", evt.Remove).
+		Logger()
+
+	// CocoCode: Normalize JID to phone number for portal lookup
+	// If this is a LID, convert it to the phone number JID so we use the correct portal
+	portalJID := evt.JID
+	if evt.JID.Server == types.HiddenUserServer {
+		pn, err := wa.GetStore().LIDs.GetPNForLID(ctx, evt.JID)
+		if err != nil {
+			log.Err(err).Msg("Failed to get phone number for LID in picture notice")
+			// Fall back to using the LID
+		} else if !pn.IsEmpty() {
+			portalJID = pn
+			log.Debug().
+				Stringer("original_jid", evt.JID).
+				Stringer("normalized_jid", portalJID).
+				Msg("Normalized LID to phone number for portal lookup")
+		}
+	}
+
+	// Get the contact name
+	userInfo, _ := wa.getUserInfo(ctx, evt.JID, false)
+	contactName := userInfo.Name
+
+	if evt.Remove {
+		// Picture was removed - send a text notice
+		noticeText := fmt.Sprintf("📷 %s removed their profile picture", contactName)
+
+		wa.UserLogin.QueueRemoteEvent(&simplevent.Message[any]{
+			EventMeta: simplevent.EventMeta{
+				Type: bridgev2.RemoteEventMessage,
+				LogContext: func(c zerolog.Context) zerolog.Context {
+					return c.Str("picture_notice", "removed")
+				},
+				PortalKey:    wa.makeWAPortalKey(portalJID), // CocoCode: Use normalized JID
+				Sender:       wa.makeEventSender(ctx, evt.JID),
+				CreatePortal: false, // CocoCode: Don't create new portal, should exist
+				Timestamp:    evt.Timestamp,
+			},
+			ID: networkid.MessageID(fmt.Sprintf("picture_remove_%s_%d", evt.JID.String(), evt.Timestamp.Unix())),
+			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data any) (*bridgev2.ConvertedMessage, error) {
+				return &bridgev2.ConvertedMessage{
+					Parts: []*bridgev2.ConvertedMessagePart{{
+						Type: event.EventMessage,
+						Content: &event.MessageEventContent{
+							MsgType: event.MsgNotice,
+							Body:    noticeText,
+						},
+					}},
+				}, nil
+			},
+		})
+		log.Info().Msg("Sent profile picture removal notice")
+	} else {
+		// Picture was updated - fetch and send the full picture
+		pictureInfo, err := wa.Client.GetProfilePictureInfo(ctx, evt.JID, &whatsmeow.GetProfilePictureParams{
+			Preview: false, // Get full resolution
+		})
+		if err != nil {
+			log.Err(err).Msg("Failed to get profile picture info")
+			return
+		}
+		if pictureInfo == nil {
+			log.Warn().Msg("Profile picture info is nil")
+			return
+		}
+
+		// Download the picture
+		pictureBytes, err := wa.downloadProfilePicture(ctx, pictureInfo.URL)
+		if err != nil {
+			log.Err(err).Msg("Failed to download profile picture")
+			return
+		}
+
+		noticeText := fmt.Sprintf("📷 %s updated their profile picture", contactName) // CocoCode: Removed debug text
+
+		wa.UserLogin.QueueRemoteEvent(&simplevent.Message[[]byte]{
+			EventMeta: simplevent.EventMeta{
+				Type: bridgev2.RemoteEventMessage,
+				LogContext: func(c zerolog.Context) zerolog.Context {
+					return c.Str("picture_notice", "updated")
+				},
+				PortalKey:    wa.makeWAPortalKey(portalJID), // CocoCode: Use normalized JID
+				Sender:       wa.makeEventSender(ctx, evt.JID),
+				CreatePortal: false, // CocoCode: Don't create new portal, should exist
+				Timestamp:    evt.Timestamp,
+			},
+			ID: networkid.MessageID(fmt.Sprintf("picture_update_%s_%d", evt.JID.String(), evt.Timestamp.Unix())),
+			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data []byte) (*bridgev2.ConvertedMessage, error) {
+				// Upload the image to Matrix
+				contentUri, _, err := intent.UploadMedia(ctx, "", data, "profile_picture.jpg", "image/jpeg")
+				if err != nil {
+					return nil, fmt.Errorf("failed to upload profile picture: %w", err)
+				}
+
+				return &bridgev2.ConvertedMessage{
+					Parts: []*bridgev2.ConvertedMessagePart{{
+						Type: event.EventMessage,
+						Content: &event.MessageEventContent{
+							MsgType: event.MsgImage,
+							Body:    noticeText,
+							URL:     contentUri,
+							Info: &event.FileInfo{
+								MimeType: "image/jpeg",
+								Size:     len(data),
+							},
+						},
+					}},
+				}, nil
+			},
+			Data: pictureBytes,
+		})
+		log.Info().Msg("Sent profile picture update with image")
+	}
+}
+
+// downloadProfilePicture downloads a profile picture from a URL
+func (wa *WhatsAppClient) downloadProfilePicture(ctx context.Context, url string) ([]byte, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
 }
 
 func (wa *WhatsAppClient) handleWAGroupInfoChange(ctx context.Context, evt *events.GroupInfo) bool {
