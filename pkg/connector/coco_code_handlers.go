@@ -391,7 +391,7 @@ func (wa *WhatsAppClient) sendMatrixPictureUpdateNotice(ctx context.Context, evt
 	}
 
 	// a file name is necessary to display in the matrix client correctly
-	fileName := fmt.Sprintf("profile.jpg")
+	fileName := fmt.Sprintf("new_profile_picture.jpg")
 	// Get image dimensions for proper Matrix display
 	width, height := cocoGetImageDimensions(pictureBytes)
 	// this is a message that is used as the caption for the picture
