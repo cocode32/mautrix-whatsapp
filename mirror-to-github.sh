@@ -9,8 +9,8 @@ set -euo pipefail
 
 # --- Config ---
 GITHUB_USER="cocode32"
-GITHUB_REPO="watgbridge"
-REMOTE_NAME="github"
+GITHUB_REPO="mautrix-whatsapp"
+REMOTE_NAME="github.com"
 
 # --- Script start ---
 echo "🔁 Starting mirror to GitHub..."
