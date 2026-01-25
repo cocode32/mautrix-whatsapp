@@ -80,6 +80,18 @@ func (wa *WhatsAppClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert message: %w", err)
 	}
+	// CocoCode: Mark all unread messages as read when sending a message
+	// This ensures WhatsApp knows we've read the chat when we reply,
+	// but only if send_read_receipts_on_matrix_read is disabled
+	if !wa.Main.Config.SendReadReceiptsOnMatrixRead {
+		portalJID, err := waid.ParsePortalID(msg.Portal.ID)
+		if err == nil {
+			// Run asynchronously so we don't block message sending
+			go wa.markUnreadMessagesAsRead(ctx, portalJID)
+		} else {
+			wa.UserLogin.Log.Err(err).Msg("Failed to parse portal ID for read receipt marking")
+		}
+	}
 	return wa.handleConvertedMatrixMessage(ctx, msg, waMsg, req)
 }
 
@@ -283,6 +295,14 @@ func (wa *WhatsAppClient) HandleMatrixMessageRemove(ctx context.Context, msg *br
 }
 
 func (wa *WhatsAppClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev2.MatrixReadReceipt) error {
+	// CocoCode: If configured, don't send read receipts to WhatsApp when reading in Matrix
+	// Messages will only be marked as read when replying instead
+	if !wa.Main.Config.SendReadReceiptsOnMatrixRead {
+		zerolog.Ctx(ctx).Trace().
+			Msg("Skipping WhatsApp read receipt (send_read_receipts_on_matrix_read is false)")
+		return nil
+	}
+
 	if !receipt.ReadUpTo.After(receipt.LastRead) {
 		return nil
 	}

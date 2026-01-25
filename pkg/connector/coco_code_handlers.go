@@ -21,6 +21,7 @@ import (
 	_ "image/png"  // Register PNG decoder
 	"io"
 	"net/http"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
@@ -500,4 +501,110 @@ func (wa *WhatsAppClient) ShouldInterceptRevoke(parsedMessageType string) bool {
 // by custom logic instead of the default behavior
 func (wa *WhatsAppClient) ShouldInterceptEdit(parsedMessageType string) bool {
 	return parsedMessageType == "edit"
+}
+
+// markUnreadMessagesAsRead marks all unread messages in a chat as read on WhatsApp.
+// This is called when sending a message to ensure WhatsApp knows we've read everything
+// up to the point we're replying, mimicking the behavior of reading in the WhatsApp app.
+// Uses the same smart batching logic as HandleMatrixReadReceipt to avoid spamming WhatsApp.
+func (wa *WhatsAppClient) markUnreadMessagesAsRead(ctx context.Context, chatJID types.JID) {
+	log := wa.UserLogin.Log.With().
+		Str("action", "coco_mark_read_on_reply").
+		Stringer("chat", chatJID).
+		Logger()
+
+	// Get the portal
+	portalKey := wa.makeWAPortalKey(chatJID)
+	portal, err := wa.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil {
+		log.Err(fmt.Errorf("failed to get portal: %w", err))
+		return
+	}
+	if portal == nil {
+		log.Debug().Msg("Portal doesn't exist, skipping read marking")
+		return
+	}
+
+	// Get the user portal to find the last read timestamp
+	userPortal, err := wa.Main.Bridge.DB.UserPortal.Get(ctx, wa.UserLogin.UserLogin, portalKey)
+	if err != nil {
+		log.Err(fmt.Errorf("failed to get user portal: %w", err))
+		return
+	}
+
+	lastRead := time.Time{}
+	if userPortal != nil && !userPortal.LastRead.IsZero() {
+		lastRead = userPortal.LastRead
+		log.Debug().Time("last_read", lastRead).Msg("Found last read timestamp from user portal")
+	} else {
+		// If we don't have a last read time, use 5 seconds ago to avoid marking very old messages
+		lastRead = time.Now().Add(-5 * time.Second)
+		log.Debug().Msg("No last read timestamp found, using 5 seconds ago")
+	}
+
+	now := time.Now()
+
+	// Get all messages between last read and now
+	messages, err := portal.Bridge.DB.Message.GetMessagesBetweenTimeQuery(ctx, portal.PortalKey, lastRead, now)
+	if err != nil {
+		log.Err(fmt.Errorf("failed to get messages to mark as read: %w", err))
+		return
+	}
+
+	if len(messages) == 0 {
+		log.Debug().Msg("No unread messages to mark")
+		return
+	}
+
+	log.Debug().
+		Int("message_count", len(messages)).
+		Time("last_read", lastRead).
+		Time("now", now).
+		Msg("Marking unread messages as read")
+
+	// Use the same smart batching logic as HandleMatrixReadReceipt
+	// Group messages by sender for group chats, or use blank key for DMs
+	messagesToRead := make(map[types.JID][]string)
+	for _, msg := range messages {
+		parsed, err := waid.ParseMessageID(msg.ID)
+		if err != nil {
+			continue
+		}
+		// Skip our own messages (they're already "read" by us)
+		if parsed.Sender.User == wa.GetStore().GetLID().User || parsed.Sender.User == wa.JID.User {
+			continue
+		}
+
+		var key types.JID
+		// In group chats, group receipts by sender. In DMs, just use blank key (no participant field).
+		if parsed.Sender != parsed.Chat {
+			key = parsed.Sender
+		}
+		messagesToRead[key] = append(messagesToRead[key], parsed.ID)
+	}
+
+	// Send the read receipts to WhatsApp
+	for messageSender, ids := range messagesToRead {
+		err = wa.Client.MarkRead(ctx, ids, now, chatJID, messageSender)
+		if err != nil {
+			log.Err(err).
+				Strs("ids", ids).
+				Stringer("sender", messageSender).
+				Msg("Failed to mark messages as read")
+		} else {
+			log.Debug().
+				Int("count", len(ids)).
+				Stringer("sender", messageSender).
+				Msg("Marked messages as read on WhatsApp")
+		}
+	}
+
+	// Update the user portal's LastRead to now since we just marked everything as read
+	if userPortal != nil {
+		userPortal.LastRead = now
+		err = wa.Main.Bridge.DB.UserPortal.Put(ctx, userPortal)
+		if err != nil {
+			log.Err(err).Msg("Failed to update user portal last read timestamp")
+		}
+	}
 }

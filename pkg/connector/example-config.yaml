@@ -5,6 +5,12 @@ os_name: Mautrix-WhatsApp bridge
 # List of valid browser names: https://github.com/tulir/whatsmeow/blob/efc632c008604016ddde63bfcfca8de4e5304da9/binary/proto/def.proto#L43-L64
 browser_name: unknown
 
+# Whether reading messages in Matrix should immediately send read receipts to WhatsApp.
+# If set to false, messages will only be marked as read on WhatsApp when you reply.
+# This allows you to read messages privately in Matrix without the sender knowing.
+# Default: true (normal behavior)
+send_read_receipts_on_matrix_read: true
+
 # Proxy to use for all WhatsApp connections.
 proxy: null
 # Alternative to proxy: an HTTP endpoint that returns the proxy URL to use for WhatsApp connections.

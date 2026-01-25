@@ -28,6 +28,11 @@ type Config struct {
 	OSName      string `yaml:"os_name"`
 	BrowserName string `yaml:"browser_name"`
 
+	// SendReadReceiptsOnMatrixRead controls whether reading messages in Matrix
+	// should send read receipts to WhatsApp. If false, messages are only marked
+	// as read on WhatsApp when you reply to them.
+	SendReadReceiptsOnMatrixRead bool `yaml:"send_read_receipts_on_matrix_read"`
+
 	Proxy          string `yaml:"proxy"`
 	GetProxyURL    string `yaml:"get_proxy_url"`
 	ProxyOnlyLogin bool   `yaml:"proxy_only_login"`
@@ -93,6 +98,8 @@ func (c *Config) PostProcess() error {
 func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Str, "os_name")
 	helper.Copy(up.Str, "browser_name")
+
+	helper.Copy(up.Bool, "send_read_receipts_on_matrix_read")
 
 	helper.Copy(up.Str|up.Null, "proxy")
 	helper.Copy(up.Str|up.Null, "get_proxy_url")
