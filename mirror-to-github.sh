@@ -37,7 +37,7 @@ echo "Pushing all refs and tags to GitHub..."
 git push --mirror "$REMOTE_NAME"
 
 # Remove github remote for a clean workspace
-echo "Cleaning up..."
-git remote remove "$REMOTE_NAME"
+#echo "Cleaning up..."
+#git remote remove "$REMOTE_NAME"
 
 echo "✅ Mirror complete: Codeberg → GitHub"
