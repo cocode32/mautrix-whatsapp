@@ -683,8 +683,5 @@ func (wa *WhatsAppClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridg
 	if err != nil {
 		return err
 	}
-	if lastKey == nil {
-		return fmt.Errorf("failed to delete chat: no messages found")
-	}
-	return wa.Client.SendAppState(ctx, appstate.BuildDeleteChat(chatJID, lastTS, lastKey))
+	return wa.Client.SendAppState(ctx, appstate.BuildDeleteChat(chatJID, lastTS, lastKey, true))
 }

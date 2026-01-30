@@ -27,6 +27,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exsync"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waWa6"
@@ -46,14 +47,16 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 	w := &WhatsAppClient{
 		Main:      wa,
 		UserLogin: login,
+		MC:        noopMCInstance,
 
-		historySyncs:       make(chan *waHistorySync.HistorySync, 64),
-		historySyncWakeup:  make(chan struct{}, 1),
-		resyncQueue:        make(map[types.JID]resyncQueueItem),
-		directMediaRetries: make(map[networkid.MessageID]*directMediaRetry),
-		mediaRetryLock:     semaphore.NewWeighted(wa.Config.HistorySync.MediaRequests.MaxAsyncHandle),
-		pushNamesSynced:    exsync.NewEvent(),
-		createDedup:        exsync.NewSet[types.MessageID](),
+		historySyncs:              make(chan *waHistorySync.HistorySync, 64),
+		historySyncWakeup:         make(chan struct{}, 1),
+		resyncQueue:               make(map[types.JID]resyncQueueItem),
+		directMediaRetries:        make(map[networkid.MessageID]*directMediaRetry),
+		mediaRetryLock:            semaphore.NewWeighted(wa.Config.HistorySync.MediaRequests.MaxAsyncHandle),
+		pushNamesSynced:           exsync.NewEvent(),
+		createDedup:               exsync.NewSet[types.MessageID](),
+		appStateFullSyncAttempted: make(map[appstate.WAPatchName]time.Time),
 	}
 	login.Client = w
 
@@ -74,10 +77,8 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 		w.Client = whatsmeow.NewClient(w.Device, waLog.Zerolog(log))
 		w.Client.AddEventHandlerWithSuccessStatus(w.handleWAEvent)
 		w.Client.SynchronousAck = true
-		if bridgev2.PortalEventBuffer == 0 {
-			w.Client.EnableDecryptedEventBuffer = true
-			w.Client.ManualHistorySyncDownload = true
-		}
+		w.Client.EnableDecryptedEventBuffer = bridgev2.PortalEventBuffer == 0
+		w.Client.ManualHistorySyncDownload = true
 		w.Client.SendReportingTokens = true
 		w.Client.AutomaticMessageRerequestFromPhone = true
 		w.Client.GetMessageForRetry = w.trackNotFoundRetry
@@ -103,6 +104,7 @@ type WhatsAppClient struct {
 	Client    *whatsmeow.Client
 	Device    *store.Device
 	JID       types.JID
+	MC        mClient
 
 	historySyncs       chan *waHistorySync.HistorySync
 	historySyncWakeup  chan struct{}
@@ -118,6 +120,9 @@ type WhatsAppClient struct {
 	pushNamesSynced    *exsync.Event
 	lastPresence       types.Presence
 	createDedup        *exsync.Set[types.MessageID]
+
+	appStateRecoveryLock      sync.Mutex
+	appStateFullSyncAttempted map[appstate.WAPatchName]time.Time
 }
 
 var (
@@ -200,6 +205,7 @@ func (wa *WhatsAppClient) Connect(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	wa.initMC()
 	wa.startLoops()
 	wa.Client.BackgroundEventCtx = wa.UserLogin.Log.WithContext(wa.Main.Bridge.BackgroundCtx)
 	zerolog.Ctx(ctx).Debug().Msg("Connecting to WhatsApp")
