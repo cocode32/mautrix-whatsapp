@@ -91,6 +91,7 @@ type WAMessageEvent struct {
 
 	parsedMessageType             string
 	isUndecryptableUpsertSubEvent bool
+	dontRenderEdited              bool
 	postHandle                    func()
 }
 
@@ -133,6 +134,14 @@ func (evt *WAMessageEvent) PreHandle(ctx context.Context, portal *bridgev2.Porta
 		return
 	}
 	meta := portal.Metadata.(*waid.PortalMetadata)
+	if meta.AddressingMode == types.AddressingModeLID && evt.Info.Sender.Server == types.DefaultUserServer {
+		evt.Info.Sender, evt.Info.SenderAlt = evt.Info.SenderAlt, evt.Info.Sender
+		zerolog.Ctx(ctx).Debug().
+			Stringer("lid", evt.Info.Sender).
+			Stringer("pn", evt.Info.SenderAlt).
+			Str("message_id", evt.Info.ID).
+			Msg("Forced phone number sender to LID in group message")
+	}
 	if meta.AddressingMode == types.AddressingModeLID || meta.LIDMigrationAttempted {
 		return
 	}
@@ -173,12 +182,15 @@ func (evt *WAMessageEvent) ConvertEdit(ctx context.Context, portal *bridgev2.Por
 	}
 	var editedMsg *waE2E.Message
 	var previouslyConvertedPart *bridgev2.ConvertedMessagePart
+	targetMessage := evt.GetTargetMessage()
+	cacheMessage := targetMessage
 	if evt.isUndecryptableUpsertSubEvent {
 		// TODO db metadata needs to be updated in this case to remove the error
 		editedMsg = evt.Message
+		cacheMessage = evt.GetID()
 	} else {
 		editedMsg = evt.Message.GetProtocolMessage().GetEditedMessage()
-		previouslyConvertedPart = evt.wa.Main.GetMediaEditCache(portal, evt.GetTargetMessage())
+		previouslyConvertedPart = evt.wa.Main.GetMediaEditCache(portal, targetMessage)
 		meta := existing[0].Metadata.(*waid.MessageMetadata)
 		if slices.Contains(meta.Edits, evt.Info.ID) {
 			return nil, fmt.Errorf("%w: edit already handled", bridgev2.ErrIgnoringRemoteEvent)
@@ -194,9 +206,11 @@ func (evt *WAMessageEvent) ConvertEdit(ctx context.Context, portal *bridgev2.Por
 		evt.postHandle = func() {
 			evt.wa.processFailedMedia(ctx, portal.PortalKey, evt.GetID(), cm, false)
 		}
+	} else if len(cm.Parts) > 0 && cacheMessage != "" {
+		evt.wa.Main.AddMediaEditCache(portal, cacheMessage, cm.Parts[0])
 	}
 	editPart := cm.Parts[0].ToEditPart(existing[0])
-	if evt.isUndecryptableUpsertSubEvent {
+	if evt.isUndecryptableUpsertSubEvent || evt.dontRenderEdited {
 		if editPart.TopLevelExtra == nil {
 			editPart.TopLevelExtra = make(map[string]any)
 		}

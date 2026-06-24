@@ -19,6 +19,7 @@ package msgconv
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,7 +50,13 @@ import (
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
 
-func (mc *MessageConverter) generateContextInfo(ctx context.Context, replyTo *database.Message, portal *bridgev2.Portal, perMessageTimer *event.BeeperDisappearingTimer) *waE2E.ContextInfo {
+func (mc *MessageConverter) generateContextInfo(
+	ctx context.Context,
+	replyTo *database.Message,
+	portal *bridgev2.Portal,
+	perMessageTimer *event.BeeperDisappearingTimer,
+	roomMention bool,
+) *waE2E.ContextInfo {
 	contextInfo := &waE2E.ContextInfo{}
 	if replyTo != nil {
 		msgID, err := waid.ParseMessageID(replyTo.ID)
@@ -57,6 +64,7 @@ func (mc *MessageConverter) generateContextInfo(ctx context.Context, replyTo *da
 			contextInfo.StanzaID = proto.String(msgID.ID)
 			contextInfo.Participant = proto.String(msgID.Sender.String())
 			contextInfo.QuotedMessage = &waE2E.Message{Conversation: proto.String("")}
+			contextInfo.QuotedType = waE2E.ContextInfo_EXPLICIT.Enum()
 		} else {
 			zerolog.Ctx(ctx).Warn().Err(err).
 				Stringer("reply_to_event_id", replyTo.MXID).
@@ -77,6 +85,9 @@ func (mc *MessageConverter) generateContextInfo(ctx context.Context, replyTo *da
 	if setAt > 0 && contextInfo.Expiration != nil {
 		contextInfo.EphemeralSettingTimestamp = ptr.Ptr(setAt)
 	}
+	if roomMention {
+		contextInfo.NonJIDMentions = proto.Uint32(1)
+	}
 	return contextInfo
 }
 
@@ -96,7 +107,7 @@ func (mc *MessageConverter) ToWhatsApp(
 	}
 
 	message := &waE2E.Message{}
-	contextInfo := mc.generateContextInfo(ctx, replyTo, portal, content.BeeperDisappearingTimer)
+	contextInfo := mc.generateContextInfo(ctx, replyTo, portal, content.BeeperDisappearingTimer, content.Mentions != nil && content.Mentions.Room)
 
 	switch content.MsgType {
 	case event.MsgText, event.MsgNotice, event.MsgEmote:
@@ -191,6 +202,7 @@ func (mc *MessageConverter) constructMediaMessage(
 				FileSHA256:    uploaded.FileSHA256,
 				FileLength:    proto.Uint64(uploaded.FileLength),
 				URL:           proto.String(uploaded.URL),
+				IsLottie:      proto.Bool(mime == "application/was"),
 			},
 		}
 	case event.MsgAudio:
@@ -472,6 +484,17 @@ func (mc *MessageConverter) convertToWebP(img []byte) ([]byte, int, error) {
 	return webpBuffer.Bytes(), size, nil
 }
 
+func (mc *MessageConverter) getOriginalBridgedSticker(ctx context.Context, info *event.BridgedSticker) (*types.StickerPackItem, error) {
+	if info == nil || info.Network != StickerSourceID || !strings.HasPrefix(info.PackURL, StickerPackURLPrefix) || info.ID == "" {
+		return nil, nil
+	}
+	fileHash, err := base64.StdEncoding.DecodeString(info.ID)
+	if err != nil {
+		return nil, nil
+	}
+	return mc.GetCachedSticker(ctx, getClient(ctx), strings.TrimPrefix(info.PackURL, StickerPackURLPrefix), fileHash)
+}
+
 func (mc *MessageConverter) reuploadFileToWhatsApp(
 	ctx context.Context, content *event.MessageEventContent,
 ) (*whatsmeow.UploadResponse, []byte, string, error) {
@@ -480,7 +503,25 @@ func (mc *MessageConverter) reuploadFileToWhatsApp(
 	if content.FileName != "" {
 		fileName = content.FileName
 	}
-	data, err := mc.Bridge.Bot.DownloadMedia(ctx, content.URL, content.File)
+	var data []byte
+	var err error
+	var sticker *types.StickerPackItem
+	if sticker, err = mc.getOriginalBridgedSticker(ctx, content.Info.BridgedSticker); err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).
+			Msg("Failed to get original bridged sticker, falling back to downloading from URL")
+		data, err = mc.Bridge.Bot.DownloadMedia(ctx, content.URL, content.File)
+	} else if sticker != nil {
+		if sticker.MimeType == "application/was" {
+			data, err = getClient(ctx).Download(ctx, sticker)
+			mime = sticker.MimeType
+		} else {
+			data, err = mc.Bridge.Bot.DownloadMedia(ctx, content.URL, content.File)
+		}
+		content.Info.Width = sticker.Width
+		content.Info.Height = sticker.Height
+	} else {
+		data, err = mc.Bridge.Bot.DownloadMedia(ctx, content.URL, content.File)
+	}
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
 	}
@@ -498,7 +539,14 @@ func (mc *MessageConverter) reuploadFileToWhatsApp(
 	case event.MessageType(event.EventSticker.Type):
 		isSticker = true
 		mediaType = whatsmeow.MediaImage
-		if mime != "image/webp" || content.Info.Width != content.Info.Height {
+		if mime == "video/lottie+json" {
+			// This likely won't work
+			data, err = PackAnimatedSticker(data)
+			if err != nil {
+				return nil, nil, mime, fmt.Errorf("%w (packing animated sticker): %w", bridgev2.ErrMediaConvertFailed, err)
+			}
+			mime = "application/was"
+		} else if (mime != "image/webp" || content.Info.Width != content.Info.Height) && mime != "application/was" {
 			var size int
 			data, size, err = mc.convertToWebP(data)
 			if err != nil {

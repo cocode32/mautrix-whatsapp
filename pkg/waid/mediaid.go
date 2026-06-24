@@ -33,9 +33,10 @@ const (
 	mediaIDTypeMessage         = 255
 	mediaIDTypeAvatar          = 254
 	mediaIDTypeCommunityAvatar = 253
+	mediaIDTypeStickerPackItem = 252
 )
 
-func MakeMediaID(messageInfo *types.MessageInfo, idOverride types.MessageID, receiver networkid.UserLoginID) networkid.MediaID {
+func MakeMediaID(messageInfo *types.MessageInfo, idOverride types.MessageID, receiver networkid.UserLoginID, version []byte) networkid.MediaID {
 	compactChat := compactJID(messageInfo.Chat.ToNonAD())
 	compactSender := compactJID(messageInfo.Sender.ToNonAD())
 	receiverID := compactJID(ParseUserLoginID(receiver, 0))
@@ -45,7 +46,7 @@ func MakeMediaID(messageInfo *types.MessageInfo, idOverride types.MessageID, rec
 	} else {
 		compactID = compactMsgID(messageInfo.ID)
 	}
-	mediaID := make([]byte, 0, 5+len(compactChat)+len(compactSender)+len(receiverID)+len(compactID))
+	mediaID := make([]byte, 0, 6+len(compactChat)+len(compactSender)+len(receiverID)+len(compactID)+len(version))
 	mediaID = append(mediaID, mediaIDTypeMessage)
 	mediaID = append(mediaID, byte(len(compactChat)))
 	mediaID = append(mediaID, compactChat...)
@@ -55,6 +56,8 @@ func MakeMediaID(messageInfo *types.MessageInfo, idOverride types.MessageID, rec
 	mediaID = append(mediaID, receiverID...)
 	mediaID = append(mediaID, byte(len(compactID)))
 	mediaID = append(mediaID, compactID...)
+	mediaID = append(mediaID, byte(len(version)))
+	mediaID = append(mediaID, version...)
 	return mediaID
 }
 
@@ -82,9 +85,28 @@ type AvatarMediaInfo struct {
 	Community bool
 }
 
+func MakeStickerPackMediaID(packID string, fileHash []byte, receiver networkid.UserLoginID) networkid.MediaID {
+	receiverID := compactJID(ParseUserLoginID(receiver, 0))
+	mediaID := make([]byte, 0, 4+len(packID)+len(fileHash)+len(receiverID))
+	mediaID = append(mediaID, mediaIDTypeStickerPackItem)
+	mediaID = append(mediaID, byte(len(packID)))
+	mediaID = append(mediaID, packID...)
+	mediaID = append(mediaID, byte(len(fileHash)))
+	mediaID = append(mediaID, fileHash...)
+	mediaID = append(mediaID, byte(len(receiverID)))
+	mediaID = append(mediaID, receiverID...)
+	return mediaID
+}
+
+type StickerPackMediaInfo struct {
+	PackID   string
+	FileHash []byte
+}
+
 type ParsedMediaID struct {
 	Message   *ParsedMessageID
 	Avatar    *AvatarMediaInfo
+	Sticker   *StickerPackMediaInfo
 	UserLogin networkid.UserLoginID
 }
 
@@ -118,6 +140,12 @@ func ParseMediaID(mediaID networkid.MediaID) (*ParsedMediaID, error) {
 			Sender: senderJID,
 			ID:     id,
 		}
+		if len(mediaID) > 0 {
+			parsed.Message.Version, err = readCompact(&mediaID, rawBytes)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse version: %w", err)
+			}
+		}
 		parsed.UserLogin = MakeUserLoginID(receiverID)
 	case mediaIDTypeAvatar, mediaIDTypeCommunityAvatar:
 		targetJID, err := readCompact(&mediaID, parseCompactJID)
@@ -136,6 +164,24 @@ func ParseMediaID(mediaID networkid.MediaID) (*ParsedMediaID, error) {
 			TargetJID: targetJID,
 			AvatarID:  avatarID,
 			Community: mediaIDType == mediaIDTypeCommunityAvatar,
+		}
+		parsed.UserLogin = MakeUserLoginID(receiverID)
+	case mediaIDTypeStickerPackItem:
+		packID, err := readCompact(&mediaID, parseString)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse sticker pack ID: %w", err)
+		}
+		fileHash, err := readCompact(&mediaID, rawBytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse sticker file hash: %w", err)
+		}
+		receiverID, err := readCompact(&mediaID, parseCompactJID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse receiver JID: %w", err)
+		}
+		parsed.Sticker = &StickerPackMediaInfo{
+			PackID:   packID,
+			FileHash: fileHash,
 		}
 		parsed.UserLogin = MakeUserLoginID(receiverID)
 	default:
@@ -244,6 +290,10 @@ func parseCompactJID(jid []byte) (types.JID, error) {
 	default:
 		return types.EmptyJID, fmt.Errorf("invalid compact JID type")
 	}
+}
+
+func rawBytes(data []byte) ([]byte, error) {
+	return data, nil
 }
 
 func readCompact[T any](data *networkid.MediaID, fn func(data []byte) (T, error)) (T, error) {

@@ -257,7 +257,7 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 		Name:  ptr.Ptr(info.Name),
 		Topic: ptr.Ptr(info.Topic),
 		Members: &bridgev2.ChatMemberList{
-			IsFull:           !info.IsIncognito,
+			IsFull:           !info.IsIncognito && !info.IsParent,
 			TotalMemberCount: len(info.Participants),
 			MemberMap:        make(map[networkid.UserID]bridgev2.ChatMember, len(info.Participants)),
 			PowerLevels: &bridgev2.PowerLevelOverrides{
@@ -284,10 +284,14 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 		},
 		ExtraUpdates: extraUpdater,
 	}
+	var hasSelf bool
 	for _, pcp := range info.Participants {
 		member := bridgev2.ChatMember{
 			EventSender: wa.makeEventSender(ctx, pcp.JID),
 			Membership:  event.MembershipJoin,
+		}
+		if member.EventSender.IsFromMe {
+			hasSelf = true
 		}
 		if pcp.IsSuperAdmin {
 			member.PowerLevel = ptr.Ptr(superAdminPL)
@@ -299,17 +303,20 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 		member.MemberEventExtra = map[string]any{
 			"com.beeper.exclude_from_timeline": true,
 		}
-		wrapped.Members.MemberMap[waid.MakeUserID(pcp.JID)] = member
+		wrapped.Members.MemberMap.Set(member)
 		if pcp.JID.Server == types.HiddenUserServer && !pcp.PhoneNumber.IsEmpty() {
-			wrapped.Members.MemberMap[waid.MakeUserID(pcp.PhoneNumber)] = bridgev2.ChatMember{
+			wrapped.Members.MemberMap.Add(bridgev2.ChatMember{
 				EventSender:    bridgev2.EventSender{Sender: waid.MakeUserID(pcp.PhoneNumber)},
 				Membership:     event.MembershipLeave,
 				PrevMembership: event.MembershipJoin,
 				MemberEventExtra: map[string]any{
 					"com.beeper.exclude_from_timeline": true,
 				},
-			}
+			})
 		}
+	}
+	if info.IsParent && !hasSelf && info.AddressingMode == types.AddressingModeLID {
+		wrapped.Members.MemberMap.Add(bridgev2.ChatMember{EventSender: wa.makeEventSender(ctx, wa.Device.LID)})
 	}
 
 	if !info.LinkedParentJID.IsEmpty() {
@@ -450,7 +457,7 @@ func (wa *WhatsAppClient) makePortalAvatarFetcher(avatarID string, sender types.
 			wrappedAvatar = &bridgev2.Avatar{
 				ID: networkid.AvatarID(avatar.ID),
 				Get: func(ctx context.Context) ([]byte, error) {
-					return wa.Client.DownloadMediaWithPath(ctx, avatar.DirectPath, nil, nil, nil, 0, "", "")
+					return wa.Client.DownloadMediaWithOnlyPath(ctx, avatar.DirectPath)
 				},
 			}
 		}
@@ -489,7 +496,7 @@ func (wa *WhatsAppClient) wrapNewsletterInfo(ctx context.Context, info *types.Ne
 	if info.ThreadMeta.Picture != nil {
 		avatar.ID = networkid.AvatarID(info.ThreadMeta.Picture.ID)
 		avatar.Get = func(ctx context.Context) ([]byte, error) {
-			return wa.Client.DownloadMediaWithPath(ctx, info.ThreadMeta.Picture.DirectPath, nil, nil, nil, 0, "", "")
+			return wa.Client.DownloadMediaWithOnlyPath(ctx, info.ThreadMeta.Picture.DirectPath)
 		}
 	} else if info.ThreadMeta.Preview.ID != "" {
 		avatar.ID = networkid.AvatarID(info.ThreadMeta.Preview.ID)
@@ -500,7 +507,7 @@ func (wa *WhatsAppClient) wrapNewsletterInfo(ctx context.Context, info *types.Ne
 			} else if meta.ThreadMeta.Picture == nil {
 				return nil, fmt.Errorf("full res avatar info is missing")
 			}
-			return wa.Client.DownloadMediaWithPath(ctx, meta.ThreadMeta.Picture.DirectPath, nil, nil, nil, 0, "", "")
+			return wa.Client.DownloadMediaWithOnlyPath(ctx, meta.ThreadMeta.Picture.DirectPath)
 		}
 	} else {
 		avatar.ID = "remove"

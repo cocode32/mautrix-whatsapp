@@ -17,8 +17,6 @@
 package msgconv
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,21 +24,19 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exfmt"
 	"go.mau.fi/util/exmime"
 	"go.mau.fi/util/exslices"
-	"go.mau.fi/util/lottie"
-	"go.mau.fi/util/random"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
@@ -87,15 +83,15 @@ func (mc *MessageConverter) convertMediaMessage(
 		MimeType:  msg.GetMimetype(),
 	}
 	if mc.DirectMedia {
-		preparedMedia.FillFileName()
 		if preparedMedia.Info.MimeType == "application/was" {
 			preparedMedia.Info.MimeType = "video/lottie+json"
 			preparedMedia.FileName = "sticker.json"
 		}
+		preparedMedia.FillFileName()
 		var err error
 		portal := getPortal(ctx)
 		idOverride := getEditTargetID(ctx)
-		preparedMedia.URL, err = portal.Bridge.Matrix.GenerateContentURI(ctx, waid.MakeMediaID(messageInfo, idOverride, portal.Receiver))
+		preparedMedia.URL, err = portal.Bridge.Matrix.GenerateContentURI(ctx, waid.MakeMediaID(messageInfo, idOverride, portal.Receiver, getMediaIDVersion(msg)))
 		if err != nil {
 			panic(fmt.Errorf("failed to generate content URI: %w", err))
 		}
@@ -124,13 +120,20 @@ func (mc *MessageConverter) convertMediaMessage(
 	return
 }
 
+func getMediaIDVersion(msg MediaMessage) []byte {
+	if encSHA256 := msg.GetFileEncSHA256(); len(encSHA256) > 0 {
+		return encSHA256
+	}
+	return msg.GetFileSHA256()
+}
+
 func (mc *MessageConverter) convertAlbumMessage(ctx context.Context, msg *waE2E.AlbumMessage) (*bridgev2.ConvertedMessagePart, *waE2E.ContextInfo) {
 	parts := make([]string, 0, 2)
 	if msg.GetExpectedImageCount() > 0 {
-		parts = append(parts, fmt.Sprintf("%d images", msg.GetExpectedImageCount()))
+		parts = append(parts, exfmt.Pluralizable("image")(int(msg.GetExpectedImageCount())))
 	}
 	if msg.GetExpectedVideoCount() > 0 {
-		parts = append(parts, fmt.Sprintf("%d videos", msg.GetExpectedVideoCount()))
+		parts = append(parts, exfmt.Pluralizable("video")(int(msg.GetExpectedVideoCount())))
 	}
 	var partDesc string
 	if len(parts) > 0 {
@@ -198,7 +201,9 @@ type PreparedMedia struct {
 }
 
 func (pm *PreparedMedia) FillFileName() *PreparedMedia {
-	if pm.FileName == "" {
+	if pm.Type == event.EventSticker {
+		pm.FileName = ""
+	} else if pm.FileName == "" {
 		pm.FileName = strings.TrimPrefix(string(pm.MsgType), "m.") + exmime.ExtensionFromMimetype(pm.Info.MimeType)
 	}
 	return pm
@@ -238,6 +243,19 @@ type MediaMessageWithDuration interface {
 }
 
 const WhatsAppStickerSize = 190
+
+func fixStickerDimensions(info *event.FileInfo) {
+	if info.Width == info.Height {
+		info.Width = WhatsAppStickerSize
+		info.Height = WhatsAppStickerSize
+	} else if info.Width > info.Height {
+		info.Height /= info.Width / WhatsAppStickerSize
+		info.Width = WhatsAppStickerSize
+	} else {
+		info.Width /= info.Height / WhatsAppStickerSize
+		info.Height = WhatsAppStickerSize
+	}
+}
 
 func prepareMediaMessage(rawMsg MediaMessage) *PreparedMedia {
 	extraInfo := map[string]any{}
@@ -287,19 +305,7 @@ func prepareMediaMessage(rawMsg MediaMessage) *PreparedMedia {
 	case *waE2E.StickerMessage:
 		data.Type = event.EventSticker
 		data.FileName = "sticker" + exmime.ExtensionFromMimetype(msg.GetMimetype())
-		if msg.GetMimetype() == "application/was" && data.FileName == "sticker" {
-			data.FileName = "sticker.json"
-		}
-		if data.Info.Width == data.Info.Height {
-			data.Info.Width = WhatsAppStickerSize
-			data.Info.Height = WhatsAppStickerSize
-		} else if data.Info.Width > data.Info.Height {
-			data.Info.Height /= data.Info.Width / WhatsAppStickerSize
-			data.Info.Width = WhatsAppStickerSize
-		} else {
-			data.Info.Width /= data.Info.Height / WhatsAppStickerSize
-			data.Info.Height = WhatsAppStickerSize
-		}
+		fixStickerDimensions(data.Info)
 	case *waE2E.VideoMessage:
 		data.MsgType = event.MsgVideo
 		pairedMediaType := msg.GetContextInfo().GetPairedMediaType()
@@ -359,14 +365,17 @@ func (mc *MessageConverter) reuploadWhatsAppAttachment(
 ) error {
 	client := getClient(ctx)
 	intent := getIntent(ctx)
-	portal := getPortal(ctx)
+	var roomID id.RoomID
+	if portal := getPortal(ctx); portal != nil {
+		roomID = portal.MXID
+	}
 	var thumbnailData []byte
 	var thumbnailInfo *event.FileInfo
 	if part.Info.Size > uploadFileThreshold {
 		var err error
-		part.URL, part.File, err = intent.UploadMediaStream(ctx, portal.MXID, -1, true, func(file io.Writer) (*bridgev2.FileStreamResult, error) {
+		part.URL, part.File, err = intent.UploadMediaStream(ctx, roomID, -1, true, func(file io.Writer) (*bridgev2.FileStreamResult, error) {
 			err := client.DownloadToFile(ctx, message, file.(*os.File))
-			if errors.Is(err, whatsmeow.ErrFileLengthMismatch) || errors.Is(err, whatsmeow.ErrInvalidMediaSHA256) {
+			if errors.Is(err, whatsmeow.ErrInvalidMediaSHA256) {
 				zerolog.Ctx(ctx).Warn().Err(err).Msg("Mismatching media checksums in message. Ignoring because WhatsApp seems to ignore them too")
 			} else if err != nil {
 				return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
@@ -387,7 +396,7 @@ func (mc *MessageConverter) reuploadWhatsAppAttachment(
 		}
 	} else {
 		data, err := client.Download(ctx, message)
-		if errors.Is(err, whatsmeow.ErrFileLengthMismatch) || errors.Is(err, whatsmeow.ErrInvalidMediaSHA256) {
+		if errors.Is(err, whatsmeow.ErrInvalidMediaSHA256) {
 			zerolog.Ctx(ctx).Warn().Err(err).Msg("Mismatching media checksums in message. Ignoring because WhatsApp seems to ignore them too")
 		} else if err != nil {
 			return fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
@@ -397,12 +406,14 @@ func (mc *MessageConverter) reuploadWhatsAppAttachment(
 			if err != nil {
 				return err
 			}
+		} else if part.Type == event.EventSticker && part.Info.MimeType == "image/webp" {
+			mc.fillWebPStickerInfo(ctx, part, data)
 		}
 		if part.Info.MimeType == "" {
 			part.Info.MimeType = http.DetectContentType(data)
 		}
 		part.FillFileName()
-		part.URL, part.File, err = intent.UploadMedia(ctx, portal.MXID, data, part.FileName, part.Info.MimeType)
+		part.URL, part.File, err = intent.UploadMedia(ctx, roomID, data, part.FileName, part.Info.MimeType)
 		if err != nil {
 			return fmt.Errorf("%w: %w", bridgev2.ErrMediaReuploadFailed, err)
 		}
@@ -411,7 +422,7 @@ func (mc *MessageConverter) reuploadWhatsAppAttachment(
 		var err error
 		part.Info.ThumbnailURL, part.Info.ThumbnailFile, err = intent.UploadMedia(
 			ctx,
-			portal.MXID,
+			roomID,
 			thumbnailData,
 			"thumbnail"+exmime.ExtensionFromMimetype(thumbnailInfo.MimeType),
 			thumbnailInfo.MimeType,
@@ -423,68 +434,6 @@ func (mc *MessageConverter) reuploadWhatsAppAttachment(
 		}
 	}
 	return nil
-}
-
-func (mc *MessageConverter) extractAnimatedSticker(fileInfo *PreparedMedia, data []byte) ([]byte, error) {
-	data, err := ExtractAnimatedSticker(data)
-	if err != nil {
-		return nil, err
-	}
-	fileInfo.Info.MimeType = "video/lottie+json"
-	fileInfo.FileName = "sticker.json"
-	return data, nil
-}
-
-func (mc *MessageConverter) convertAnimatedSticker(ctx context.Context, fileInfo *PreparedMedia, data []byte) ([]byte, []byte, *event.FileInfo, error) {
-	data, err := mc.extractAnimatedSticker(fileInfo, data)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	c := mc.AnimatedStickerConfig
-	if c.Target == "disable" {
-		return data, nil, nil, nil
-	} else if !lottie.Supported() {
-		zerolog.Ctx(ctx).Warn().Msg("Animated sticker conversion is enabled, but lottieconverter is not installed")
-		return data, nil, nil, nil
-	}
-	input := bytes.NewReader(data)
-	fileInfo.Info.MimeType = "image/" + c.Target
-	fileInfo.FileName = "sticker." + c.Target
-	switch c.Target {
-	case "png":
-		var output bytes.Buffer
-		err = lottie.Convert(ctx, input, "", &output, c.Target, c.Args.Width, c.Args.Height, "1")
-		return output.Bytes(), nil, nil, err
-	case "gif":
-		var output bytes.Buffer
-		err = lottie.Convert(ctx, input, "", &output, c.Target, c.Args.Width, c.Args.Height, strconv.Itoa(c.Args.FPS))
-		return output.Bytes(), nil, nil, err
-	case "webm", "webp":
-		tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("mautrix-whatsapp-lottieconverter-%s.%s", random.String(10), c.Target))
-		defer func() {
-			_ = os.Remove(tmpFile)
-		}()
-		thumbnailData, err := lottie.FFmpegConvert(ctx, input, tmpFile, c.Args.Width, c.Args.Height, c.Args.FPS)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		data, err = os.ReadFile(tmpFile)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to read converted file: %w", err)
-		}
-		var thumbnailInfo *event.FileInfo
-		if thumbnailData != nil {
-			thumbnailInfo = &event.FileInfo{
-				MimeType: "image/png",
-				Width:    c.Args.Width,
-				Height:   c.Args.Height,
-				Size:     len(thumbnailData),
-			}
-		}
-		return data, thumbnailData, thumbnailInfo, nil
-	default:
-		return nil, nil, nil, fmt.Errorf("unsupported target format %s", c.Target)
-	}
 }
 
 func (mc *MessageConverter) makeMediaFailure(ctx context.Context, mediaInfo *PreparedMedia, keys *FailedMediaKeys, err error) *bridgev2.ConvertedMessagePart {
@@ -530,29 +479,4 @@ func (mc *MessageConverter) makeMediaFailure(ctx context.Context, mediaInfo *Pre
 		part.Content.Body += "\n\n" + mediaInfo.Body
 	}
 	return part
-}
-
-func ExtractAnimatedSticker(data []byte) ([]byte, error) {
-	zipReader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read sticker zip: %w", err)
-	}
-	animationFile, err := zipReader.Open("animation/animation.json")
-	if err != nil {
-		return nil, fmt.Errorf("failed to open animation.json: %w", err)
-	}
-	animationFileInfo, err := animationFile.Stat()
-	if err != nil {
-		_ = animationFile.Close()
-		return nil, fmt.Errorf("failed to stat animation.json: %w", err)
-	} else if animationFileInfo.Size() > uploadFileThreshold {
-		_ = animationFile.Close()
-		return nil, fmt.Errorf("animation.json is too large (%.2f MiB)", float64(animationFileInfo.Size())/1024/1024)
-	}
-	data, err = io.ReadAll(animationFile)
-	_ = animationFile.Close()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read animation.json: %w", err)
-	}
-	return data, nil
 }

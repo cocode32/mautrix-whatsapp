@@ -20,14 +20,16 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"html"
 	"html/template"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exerrors"
+	"go.mau.fi/util/exfmt"
 	"go.mau.fi/util/ptr"
-	"go.mau.fi/whatsmeow/proto/waAICommon"
+	"go.mau.fi/whatsmeow/proto/waAICommonDeprecated"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
@@ -100,7 +102,7 @@ func (mc *MessageConverter) convertGroupInviteMessage(ctx context.Context, info 
 		}
 	}
 
-	htmlMessage := fmt.Sprintf(template, event.TextToHTML(msg.GetCaption()), msg.GetGroupName(), expiry, mc.Bridge.Config.CommandPrefix)
+	htmlMessage := fmt.Sprintf(template, event.TextToHTML(msg.GetCaption()), html.EscapeString(msg.GetGroupName()), expiry, mc.Bridge.Config.CommandPrefix)
 	content := &event.MessageEventContent{
 		MsgType:       event.MsgText,
 		Body:          format.HTMLToText(htmlMessage),
@@ -113,6 +115,92 @@ func (mc *MessageConverter) convertGroupInviteMessage(ctx context.Context, info 
 		Extra:   extraAttrs,
 		DBMetadata: &waid.MessageMetadata{
 			GroupInvite: inviteMeta,
+		},
+	}, msg.GetContextInfo()
+}
+
+func (mc *MessageConverter) formatMessageHistoryNoticeJID(ctx context.Context, jid types.JID) string {
+	_, displayName, err := mc.getBasicUserInfo(ctx, jid)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Stringer("jid", jid).Msg("Failed to get user info for message history notice")
+	} else if displayName != "" {
+		return displayName
+	}
+	switch jid.Server {
+	case types.DefaultUserServer:
+		return "+" + jid.User
+	default:
+		return "Unknown user " + jid.String()
+	}
+}
+
+const maxMessageHistoryNoticeReceivers = 5
+
+var others = exfmt.Pluralizable("other")
+
+func (mc *MessageConverter) formatMessageHistoryNoticeReceivers(ctx context.Context, receivers []string) string {
+	receiverLimit := min(len(receivers), maxMessageHistoryNoticeReceivers)
+	receiverNames := make([]string, 0, receiverLimit)
+	for _, receiver := range receivers[:receiverLimit] {
+		jid, err := types.ParseJID(receiver)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Str("receiver", receiver).Msg("Failed to parse message history receiver JID")
+			receiverNames = append(receiverNames, receiver)
+		} else {
+			receiverNames = append(receiverNames, mc.formatMessageHistoryNoticeJID(ctx, jid))
+		}
+	}
+	receiverText := strings.Join(receiverNames, ", ")
+	if len(receivers) > receiverLimit {
+		receiverText = fmt.Sprintf("%s + %s", receiverText, others(len(receivers)-receiverLimit))
+	}
+	return receiverText
+}
+
+func (mc *MessageConverter) messageHistoryNoticeLocation(ctx context.Context) *time.Location {
+	portal := getPortal(ctx)
+	loginID := portal.Receiver
+	if loginID == "" {
+		loginID = waid.MakeUserLoginID(getClient(ctx).Store.GetJID().ToNonAD())
+	}
+	if login := mc.Bridge.GetCachedUserLoginByID(loginID); login != nil {
+		meta, _ := login.Metadata.(*waid.UserLoginMetadata)
+		loc, err := meta.LoadTimezone()
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Str("timezone", meta.Timezone).Msg("Failed to load user timezone for message history notice")
+		} else if loc != nil {
+			return loc
+		}
+	}
+	return time.Local
+}
+
+func (mc *MessageConverter) convertMessageHistoryNotice(ctx context.Context, info *types.MessageInfo, msg *waE2E.MessageHistoryNotice) (*bridgev2.ConvertedMessagePart, *waE2E.ContextInfo) {
+	metadata := msg.GetMessageHistoryMetadata()
+
+	sender := mc.formatMessageHistoryNoticeJID(ctx, info.Sender)
+	body := fmt.Sprintf("%s sent message history", sender)
+	if receiverText := mc.formatMessageHistoryNoticeReceivers(ctx, metadata.GetHistoryReceivers()); receiverText != "" {
+		body = fmt.Sprintf("%s to %s", body, receiverText)
+	}
+	if count := metadata.GetMessageCount(); count > 0 {
+		messageWord := "messages"
+		if count == 1 {
+			messageWord = "message"
+		}
+		body = fmt.Sprintf("%s (%d %s)", body, count, messageWord)
+	}
+	if metadata != nil && metadata.OldestMessageTimestampInWindow != nil {
+		oldestTS := time.Unix(metadata.GetOldestMessageTimestampInWindow(), 0).In(mc.messageHistoryNoticeLocation(ctx))
+		body = fmt.Sprintf("%s, starting %s", body, oldestTS.Format("Jan 2, 2006 at 3:04 PM"))
+	}
+	body += "."
+
+	return &bridgev2.ConvertedMessagePart{
+		Type: event.EventMessage,
+		Content: &event.MessageEventContent{
+			MsgType: event.MsgNotice,
+			Body:    body,
 		},
 	}, msg.GetContextInfo()
 }
@@ -266,8 +354,9 @@ func (mc *MessageConverter) convertKeepInChatMessage(ctx context.Context, msg *w
 func (mc *MessageConverter) convertRichResponseMessage(ctx context.Context, msg *waE2E.AIRichResponseMessage) (*bridgev2.ConvertedMessagePart, *waE2E.ContextInfo) {
 	var body strings.Builder
 
+	// TODO switch to new format?
 	for i, submsg := range msg.GetSubmessages() {
-		if submsg.GetMessageType() == waAICommon.AIRichResponseSubMessageType_AI_RICH_RESPONSE_TEXT {
+		if submsg.GetMessageType() == waAICommonDeprecated.AIRichResponseSubMessageType_AI_RICH_RESPONSE_TEXT {
 			if i > 0 {
 				body.WriteString("\n")
 			}

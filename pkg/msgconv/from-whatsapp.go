@@ -140,6 +140,9 @@ func (mc *MessageConverter) ToMatrix(
 	isBackfill bool,
 	previouslyConvertedPart *bridgev2.ConvertedMessagePart,
 ) *bridgev2.ConvertedMessage {
+	if waMsg == nil {
+		waMsg = &waE2E.Message{}
+	}
 	ctx = context.WithValue(ctx, contextKeyClient, client)
 	ctx = context.WithValue(ctx, contextKeyIntent, intent)
 	ctx = context.WithValue(ctx, contextKeyPortal, portal)
@@ -212,6 +215,8 @@ func (mc *MessageConverter) ToMatrix(
 		part, contextInfo = mc.convertPlaceholderMessage(ctx, waMsg)
 	case waMsg.GroupInviteMessage != nil:
 		part, contextInfo = mc.convertGroupInviteMessage(ctx, info, waMsg.GroupInviteMessage)
+	case waMsg.MessageHistoryNotice != nil:
+		part, contextInfo = mc.convertMessageHistoryNotice(ctx, info, waMsg.MessageHistoryNotice)
 	case waMsg.ProtocolMessage != nil && waMsg.ProtocolMessage.GetType() == waE2E.ProtocolMessage_EPHEMERAL_SETTING:
 		part, contextInfo = mc.convertEphemeralSettingMessage(ctx, waMsg.ProtocolMessage, info.Timestamp, isBackfill)
 	case waMsg.EncCommentMessage != nil:
@@ -234,6 +239,9 @@ func (mc *MessageConverter) ToMatrix(
 		part.Extra["fi.mau.whatsapp.source_broadcast_list"] = info.Chat.String()
 	}
 	mc.addMentions(ctx, contextInfo.GetMentionedJID(), part.Content)
+	if contextInfo.GetNonJIDMentions() == 1 {
+		part.Content.Mentions.Room = true
+	}
 
 	cm := &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{part},

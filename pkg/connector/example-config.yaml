@@ -70,6 +70,11 @@ force_active_delivery_receipts: false
 direct_media_auto_request: true
 # Should the bridge automatically reconnect if it fails to connect on startup?
 initial_auto_reconnect: true
+# WhatsApp messages are sometimes undecryptable. Should the bridge store messages it sends in the
+# bridge database in order to accept retry receipts from other WhatsApp users for messages sent via
+# the bridge? By default, the bridge only stores messages in memory, and therefore can't accept
+# retry receipts if the bridge is restarted after the message is sent.
+use_whatsapp_retry_store: false
 
 # Settings for converting animated stickers.
 animated_sticker:
@@ -122,3 +127,6 @@ history_sync:
         request_local_time: 120
         # Maximum number of media request responses to handle in parallel per user.
         max_async_handle: 2
+    # Use on-demand history sync requests for fetching older messages?
+    # This only applies when using the backfill queue, never for forward backfills.
+    backwards_on_demand: false

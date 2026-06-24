@@ -28,7 +28,6 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"maunium.net/go/mautrix/bridgev2"
@@ -77,6 +76,7 @@ func init() {
 func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 	log := wa.UserLogin.Log
 	ctx := log.WithContext(wa.Main.Bridge.BackgroundCtx)
+	wa.MC.OnWhatsAppEvent(rawEvt)
 
 	success = true
 	switch evt := rawEvt.(type) {
@@ -111,9 +111,7 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 		success = wa.handleWAPin(evt)
 
 	case *events.HistorySync:
-		if wa.Main.Bridge.Config.Backfill.Enabled {
-			wa.historySyncs <- evt.Data
-		}
+		wa.UserLogin.Log.Warn().Msg("Unexpected history sync event received")
 	case *events.MediaRetry:
 		wa.phoneSeen(evt.Timestamp)
 		success = wa.UserLogin.QueueRemoteEvent(&WAMediaRetry{MediaRetry: evt, wa: wa}).Success
@@ -128,6 +126,20 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 		success = wa.handleWANewsletterLeave(evt)
 	case *events.Picture:
 		success = wa.handleWAPictureUpdate(ctx, evt)
+	case *events.NotifyAccountReachoutTimelock:
+		wa.UserLogin.TrackAnalytics("WhatsApp Account Reachout Timelock", map[string]any{
+			"enforcement_type":      evt.EnforcementType,
+			"is_active":             evt.IsActive,
+			"time_enforcement_ends": evt.TimeEnforcementEnds.Time,
+		})
+		wa.UserLogin.Metadata.(*waid.UserLoginMetadata).ReachoutTimelockUntil = evt.TimeEnforcementEnds.Time
+		if wa.UserLogin.BridgeState.GetPrevUnsent().StateEvent == status.StateConnected {
+			wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+		}
+		err := wa.UserLogin.Save(ctx)
+		if err != nil {
+			log.Err(err).Msg("Failed to save user login metadata after reachout timelock update")
+		}
 
 	case *events.AppStateSyncComplete:
 		wa.handleWAAppStateSyncComplete(ctx, evt)
@@ -172,7 +184,6 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 			}()
 			go wa.syncRemoteProfile(ctx, nil)
 		}
-		wa.MC.OnConnect(store.GetWAVersion()[2], wa.Device.Platform)
 	case *events.OfflineSyncPreview:
 		log.Info().
 			Int("message_count", evt.Messages).
@@ -313,48 +324,9 @@ func (wa *WhatsAppClient) rerouteWAMessage(ctx context.Context, evtType string, 
 
 func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Message) (success bool) {
 	success = true
-	wa.rerouteWAMessage(ctx, "message", &evt.Info.MessageSource, evt.Info.ID)
-	wa.UserLogin.Log.Trace().
-		Any("info", evt.Info).
-		Any("payload", evt.Message).
-		Msg("Received WhatsApp message")
 	if evt.Info.Chat == types.StatusBroadcastJID && !wa.Main.Config.EnableStatusBroadcast {
 		return
 	}
-	if evt.Info.IsFromMe &&
-		evt.Message.GetProtocolMessage().GetHistorySyncNotification() != nil &&
-		wa.Main.Bridge.Config.Backfill.Enabled &&
-		wa.Client.ManualHistorySyncDownload {
-		wa.saveWAHistorySyncNotification(ctx, evt.Message.ProtocolMessage.HistorySyncNotification)
-	}
-
-	messageAssoc := evt.Message.GetMessageContextInfo().GetMessageAssociation()
-	if assocType := messageAssoc.GetAssociationType(); assocType == waE2E.MessageAssociation_HD_IMAGE_DUAL_UPLOAD || assocType == waE2E.MessageAssociation_HD_VIDEO_DUAL_UPLOAD {
-		parentKey := messageAssoc.GetParentMessageKey()
-		associatedMessage := evt.Message.GetAssociatedChildMessage().GetMessage()
-		wa.UserLogin.Log.Debug().
-			Str("message_id", evt.Info.ID).
-			Str("parent_id", parentKey.GetID()).
-			Stringer("assoc_type", assocType).
-			Msg("Received HD replacement message, converting to edit")
-
-		protocolMsg := &waE2E.ProtocolMessage{
-			Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
-			Key:           parentKey,
-			EditedMessage: associatedMessage,
-		}
-		evt.Message = &waE2E.Message{
-			ProtocolMessage: protocolMsg,
-		}
-	} else if assocType == waE2E.MessageAssociation_MOTION_PHOTO {
-		//evt.Message = evt.Message.GetAssociatedChildMessage().GetMessage()
-		wa.UserLogin.Log.Debug().
-			Str("message_id", evt.Info.ID).
-			Str("parent_id", messageAssoc.GetParentMessageKey().GetID()).
-			Msg("Ignoring motion photo update")
-		return
-	}
-
 	parsedMessageType := getMessageType(evt.Message)
 	if parsedMessageType == "ignore" || strings.HasPrefix(parsedMessageType, "unknown_protocol_") {
 		return
@@ -390,13 +362,76 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 	if encMessage := evt.Message.GetSecretEncryptedMessage(); encMessage != nil {
 		decrypted, err := wa.Client.DecryptSecretEncryptedMessage(ctx, evt)
 		if err != nil {
-			wa.UserLogin.Log.Err(err).Str("message_id", evt.Info.ID).Msg("Failed to decrypt message")
+			wa.UserLogin.Log.Err(err).
+				Str("message_id", evt.Info.ID).
+				Stringer("evt_sender", evt.Info.Sender).
+				Any("target_message_key", encMessage.TargetMessageKey).
+				Msg("Failed to decrypt secret-encrypted message")
 			return
 		}
 		evt.RawMessage = decrypted
 		evt.UnwrapRaw()
 		parsedMessageType = getMessageType(evt.Message)
 	}
+
+	if parsedMessageType == "ignore" || strings.HasPrefix(parsedMessageType, "unknown_protocol_") {
+		return
+	}
+	// CocoCode: Intercept revoke/edit messages - send local Matrix notices instead of remote events
+	// See coco_code_handlers.go for implementation details
+	if wa.ShouldInterceptRevoke(parsedMessageType) {
+		return wa.handleMatrixMessageRevoke(ctx, evt)
+	}
+	if wa.ShouldInterceptEdit(parsedMessageType) {
+		return wa.handleMatrixMessageEdit(ctx, evt)
+	}
+
+	wa.rerouteWAMessage(ctx, "message", &evt.Info.MessageSource, evt.Info.ID)
+	wa.UserLogin.Log.Trace().
+		Any("info", evt.Info).
+		Any("payload", evt.Message).
+		Msg("Received WhatsApp message")
+	if evt.Info.IsFromMe &&
+		evt.Message.GetProtocolMessage().GetHistorySyncNotification() != nil &&
+		wa.Main.Bridge.Config.Backfill.Enabled {
+		wa.saveWAHistorySyncNotification(ctx, evt.Message.ProtocolMessage.HistorySyncNotification)
+	}
+
+	dontRenderEdited := false
+	messageAssoc := evt.Message.GetMessageContextInfo().GetMessageAssociation()
+	if assocType := messageAssoc.GetAssociationType(); assocType == waE2E.MessageAssociation_HD_IMAGE_DUAL_UPLOAD || assocType == waE2E.MessageAssociation_HD_VIDEO_DUAL_UPLOAD {
+		parentKey := messageAssoc.GetParentMessageKey()
+		protocolMsg := evt.Message.GetProtocolMessage()
+		if protocolMsg.GetType() != waE2E.ProtocolMessage_MESSAGE_EDIT || protocolMsg.GetKey() == nil {
+			protocolMsg = &waE2E.ProtocolMessage{
+				Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+				Key:           parentKey,
+				EditedMessage: evt.Message.GetAssociatedChildMessage().GetMessage(),
+			}
+			dontRenderEdited = true
+		} else if child := protocolMsg.GetEditedMessage().GetAssociatedChildMessage().GetMessage(); child != nil {
+			protocolMsg.EditedMessage = child
+			protocolMsg.Key = parentKey
+		}
+		wa.UserLogin.Log.Debug().
+			Str("message_id", evt.Info.ID).
+			Str("parent_id", parentKey.GetID()).
+			Stringer("assoc_type", assocType).
+			Msg("Received HD replacement message, converting to edit")
+
+		evt.Message = &waE2E.Message{
+			ProtocolMessage: protocolMsg,
+		}
+		parsedMessageType = getMessageType(evt.Message)
+	} else if assocType == waE2E.MessageAssociation_MOTION_PHOTO {
+		//evt.Message = evt.Message.GetAssociatedChildMessage().GetMessage()
+		wa.UserLogin.Log.Debug().
+			Str("message_id", evt.Info.ID).
+			Str("parent_id", messageAssoc.GetParentMessageKey().GetID()).
+			Msg("Ignoring motion photo update")
+		return
+	}
+
 	res := wa.UserLogin.QueueRemoteEvent(&WAMessageEvent{
 		MessageInfoWrapper: &MessageInfoWrapper{
 			Info: evt.Info,
@@ -406,6 +441,7 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 		MsgEvent: evt,
 
 		parsedMessageType: parsedMessageType,
+		dontRenderEdited:  dontRenderEdited,
 	})
 	return res.Success
 }
@@ -523,7 +559,7 @@ func (wa *WhatsAppClient) handleWALogout(reason events.ConnectFailureReason, onC
 	} else if reason == events.ConnectFailureMainDeviceGone {
 		errorCode = WAMainDeviceGone
 	}
-	wa.Client.Disconnect()
+	wa.Disconnect()
 	wa.Client = nil
 	wa.JID = types.EmptyJID
 	wa.UserLogin.Metadata.(*waid.UserLoginMetadata).WADeviceID = 0

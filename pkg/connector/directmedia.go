@@ -17,6 +17,7 @@
 package connector
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -67,6 +68,8 @@ func (wa *WhatsAppConnector) Download(ctx context.Context, mediaID networkid.Med
 		return wa.downloadMessageDirectMedia(ctx, parsedID, params)
 	} else if parsedID.Avatar != nil {
 		return wa.downloadAvatarDirectMedia(ctx, parsedID, params)
+	} else if parsedID.Sticker != nil {
+		return wa.downloadStickerDirectMedia(ctx, parsedID, params)
 	} else {
 		return nil, fmt.Errorf("unexpected media ID parsing result")
 	}
@@ -128,15 +131,30 @@ func (wa *WhatsAppConnector) downloadAvatarDirectMedia(ctx context.Context, pars
 	}
 	return &mediaproxy.GetMediaResponseFile{
 		Callback: func(w *os.File) (*mediaproxy.FileMeta, error) {
-			return &mediaproxy.FileMeta{}, waClient.Client.DownloadMediaWithPathToFile(
-				ctx, cachedInfo.DirectPath, nil, nil, nil, 0, "", "", w,
-			)
+			return &mediaproxy.FileMeta{}, waClient.Client.DownloadMediaWithOnlyPathToFile(ctx, cachedInfo.DirectPath, w)
 		},
 	}, nil
 }
 
+func (wa *WhatsAppConnector) downloadStickerDirectMedia(ctx context.Context, parsedID *waid.ParsedMediaID, params map[string]string) (mediaproxy.GetMediaResponse, error) {
+	ul := wa.Bridge.GetCachedUserLoginByID(parsedID.UserLogin)
+	if ul == nil {
+		return nil, fmt.Errorf("%w: user login %s not found", bridgev2.ErrNotLoggedIn, parsedID.UserLogin)
+	}
+	waClient := ul.Client.(*WhatsAppClient)
+	if waClient.Client == nil {
+		return nil, fmt.Errorf("no WhatsApp client found on login %s", parsedID.UserLogin)
+	}
+	sticker, err := wa.MsgConv.GetCachedSticker(ctx, waClient.Client, parsedID.Sticker.PackID, parsedID.Sticker.FileHash)
+	if err != nil {
+		return nil, err
+	} else if sticker == nil {
+		return nil, mautrix.MNotFound.WithMessage("Sticker not found in pack")
+	}
+	return wa.makeDirectMediaResponse(ctx, waClient, sticker, sticker.MimeType, "", nil, params)
+}
+
 func (wa *WhatsAppConnector) downloadMessageDirectMedia(ctx context.Context, parsedID *waid.ParsedMediaID, params map[string]string) (mediaproxy.GetMediaResponse, error) {
-	log := zerolog.Ctx(ctx)
 	msg, err := wa.Bridge.DB.Message.GetFirstPartByID(ctx, parsedID.UserLogin, parsedID.Message.String())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get message: %w", err)
@@ -151,6 +169,9 @@ func (wa *WhatsAppConnector) downloadMessageDirectMedia(ctx context.Context, par
 	err = json.Unmarshal(dmm, &keys)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal media keys: %w", err)
+	}
+	if version := parsedID.Message.Version; len(version) > 0 && !bytes.Equal(version, keys.EncSHA256) && !bytes.Equal(version, keys.SHA256) {
+		return nil, mautrix.MNotFound.WithMessage("Version mismatch, media was likely replaced")
 	}
 	var ul *bridgev2.UserLogin
 	if parsedID.UserLogin != "" {
@@ -174,16 +195,29 @@ func (wa *WhatsAppConnector) downloadMessageDirectMedia(ctx context.Context, par
 	if waClient.Client == nil {
 		return nil, fmt.Errorf("no WhatsApp client found on login")
 	}
+	return wa.makeDirectMediaResponse(ctx, waClient, keys, keys.MimeType, msg.ID, keys, params)
+}
+
+func (wa *WhatsAppConnector) makeDirectMediaResponse(
+	ctx context.Context,
+	waClient *WhatsAppClient,
+	dm whatsmeow.DownloadableMessage,
+	mimeType string,
+	msgID networkid.MessageID,
+	keys *msgconv.FailedMediaKeys,
+	params map[string]string,
+) (mediaproxy.GetMediaResponse, error) {
 	return &mediaproxy.GetMediaResponseFile{
 		Callback: func(f *os.File) (*mediaproxy.FileMeta, error) {
-			err := waClient.Client.DownloadToFile(ctx, keys, f)
-			if errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) || errors.Is(err, whatsmeow.ErrNoURLPresent) {
+			log := zerolog.Ctx(ctx)
+			err := waClient.Client.DownloadToFile(ctx, dm, f)
+			if keys != nil && (errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) || errors.Is(err, whatsmeow.ErrNoURLPresent)) {
 				val := params["fi.mau.whatsapp.reload_media"]
 				if val == "false" || (!wa.Config.DirectMediaAutoRequest && val != "true") {
 					return nil, ErrReloadNeeded
 				}
 				log.Trace().Msg("Media not found for direct download, requesting and waiting")
-				err = waClient.requestAndWaitDirectMedia(ctx, msg.ID, keys)
+				err = waClient.requestAndWaitDirectMedia(ctx, msgID, keys)
 				if err != nil {
 					log.Trace().Err(err).Msg("Failed to wait for media for direct download")
 					return nil, err
@@ -191,30 +225,29 @@ func (wa *WhatsAppConnector) downloadMessageDirectMedia(ctx context.Context, par
 				log.Trace().Msg("Retrying download after successful retry")
 				err = waClient.Client.DownloadToFile(ctx, keys, f)
 			}
-			if errors.Is(err, whatsmeow.ErrFileLengthMismatch) || errors.Is(err, whatsmeow.ErrInvalidMediaSHA256) {
+			if errors.Is(err, whatsmeow.ErrInvalidMediaSHA256) {
 				zerolog.Ctx(ctx).Warn().Err(err).Msg("Mismatching media checksums in message. Ignoring because WhatsApp seems to ignore them too")
 			} else if err != nil {
 				return nil, err
 			}
 
-			mime := keys.MimeType
-			if mime == "application/was" {
+			if mimeType == "application/was" {
 				if _, err := f.Seek(0, io.SeekStart); err != nil {
 					return nil, fmt.Errorf("failed to seek to start of sticker zip: %w", err)
 				} else if zipData, err := io.ReadAll(f); err != nil {
 					return nil, fmt.Errorf("failed to read sticker zip: %w", err)
-				} else if data, err := msgconv.ExtractAnimatedSticker(zipData); err != nil {
+				} else if data, _, err := msgconv.ExtractAnimatedSticker(zipData); err != nil {
 					return nil, fmt.Errorf("failed to extract animated sticker: %w %x", err, zipData)
 				} else if _, err := f.WriteAt(data, 0); err != nil {
 					return nil, fmt.Errorf("failed to write animated sticker to file: %w", err)
 				} else if err := f.Truncate(int64(len(data))); err != nil {
 					return nil, fmt.Errorf("failed to truncate animated sticker file: %w", err)
 				}
-				mime = "video/lottie+json"
+				mimeType = "video/lottie+json"
 			}
 
 			return &mediaproxy.FileMeta{
-				ContentType: mime,
+				ContentType: mimeType,
 			}, nil
 		},
 	}, nil

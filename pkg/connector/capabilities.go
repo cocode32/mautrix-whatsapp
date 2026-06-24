@@ -19,6 +19,7 @@ var WhatsAppGeneralCaps = &bridgev2.NetworkGeneralCapabilities{
 	AggressiveUpdateInfo: true,
 	ImplicitReadReceipts: true,
 	Provisioning: bridgev2.ProvisioningCapabilities{
+		ImagePackImport: true,
 		ResolveIdentifier: bridgev2.ResolveIdentifierCapabilities{
 			CreateDM:    true,
 			LookupPhone: true,
@@ -51,7 +52,7 @@ func (wa *WhatsAppConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilit
 }
 
 func (wa *WhatsAppConnector) GetBridgeInfoVersion() (info, caps int) {
-	return 1, 7
+	return 1, 8
 }
 
 const WAMaxFileSize = 2000 * 1024 * 1024
@@ -66,7 +67,7 @@ func supportedIfFFmpeg() event.CapabilitySupportLevel {
 }
 
 func capID() string {
-	base := "fi.mau.whatsapp.capabilities.2025_12_15"
+	base := "fi.mau.whatsapp.capabilities.2026_05_12"
 	if ffmpeg.Supported() {
 		return base + "+ffmpeg"
 	}
@@ -125,10 +126,10 @@ var whatsappCaps = &event.RoomFeatures{
 		event.CapMsgSticker: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
 				"image/webp": event.CapLevelFullySupported,
-				// TODO see if sending lottie is possible
-				//"video/lottie+json": event.CapLevelFullySupported,
 				"image/png":  event.CapLevelPartialSupport,
 				"image/jpeg": event.CapLevelPartialSupport,
+				// This will only be accepted if it was imported from WhatsApp
+				"video/lottie+json": event.CapLevelPartialSupport,
 			},
 			Caption: event.CapLevelDropped,
 			MaxSize: WAMaxFileSize,

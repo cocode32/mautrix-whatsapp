@@ -1,3 +1,36 @@
+# v26.06
+
+* Added placeholder for group message history share notices.
+* Fixed community spaces not being bridged properly in some cases.
+* Fixed handling edits of HD media.
+* Fixed duplicate message when a message from another own device is initially
+  undecryptable and later gets resolved.
+
+# v26.05
+
+* Added support for importing sticker packs from WhatsApp.
+* Added support for WhatsApp's new message edit encryption scheme.
+
+# v26.04
+
+* Added support for @room mentions in both directions.
+* Changed initial backfill to happen even if WhatsApp doesn't send full history.
+* Fixed panic when handling updates to unknown polls from WhatsApp.
+* Fixed some background loops not stopping when a user is logged out.
+
+# v26.03
+
+* Added option to save outgoing messages in the database to allow encryption
+  retries to work across restarts.
+* Fixed contact list API not returning some contacts.
+* Fixed business template messages with media duplicating the text part.
+
+# v26.02
+
+* Bumped minimum Go version to 1.25.
+* Added automatic recovery for WhatsApp app state sync issues.
+* Fixed LID redirects for some non-message events.
+
 # v26.01
 
 * Fixed broadcast list messages to LIDs causing split DMs.

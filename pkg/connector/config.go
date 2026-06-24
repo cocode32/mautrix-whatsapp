@@ -2,6 +2,7 @@ package connector
 
 import (
 	_ "embed"
+	"fmt"
 	"strings"
 	"text/template"
 	"time"
@@ -55,6 +56,7 @@ type Config struct {
 	ForceActiveDeliveryReceipts bool          `yaml:"force_active_delivery_receipts"`
 	DirectMediaAutoRequest      bool          `yaml:"direct_media_auto_request"`
 	InitialAutoReconnect        bool          `yaml:"initial_auto_reconnect"`
+	UseWhatsAppRetryStore       bool          `yaml:"use_whatsapp_retry_store"`
 
 	AnimatedSticker msgconv.AnimatedStickerConfig `yaml:"animated_sticker"`
 
@@ -74,6 +76,8 @@ type Config struct {
 			RequestLocalTime int                `yaml:"request_local_time"`
 			MaxAsyncHandle   int64              `yaml:"max_async_handle"`
 		} `yaml:"media_requests"`
+
+		BackwardsOnDemand bool `yaml:"backwards_on_demand"`
 	} `yaml:"history_sync"`
 
 	displaynameTemplate *template.Template `yaml:"-"`
@@ -92,7 +96,15 @@ func (c *Config) UnmarshalYAML(node *yaml.Node) error {
 func (c *Config) PostProcess() error {
 	var err error
 	c.displaynameTemplate, err = template.New("displayname").Parse(c.DisplaynameTemplate)
-	return err
+	if err != nil {
+		return err
+	}
+	// Try to execute template to make sure it's valid
+	_, err = c.formatDisplayname(types.PSAJID, "", types.ContactInfo{})
+	if err != nil {
+		return fmt.Errorf("failed to execute displayname template: %w", err)
+	}
+	return nil
 }
 
 func upgradeConfig(helper up.Helper) {
@@ -123,6 +135,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "force_active_delivery_receipts")
 	helper.Copy(up.Bool, "direct_media_auto_request")
 	helper.Copy(up.Bool, "initial_auto_reconnect")
+	helper.Copy(up.Bool, "use_whatsapp_retry_store")
 
 	helper.Copy(up.Str, "animated_sticker", "target")
 	helper.Copy(up.Int, "animated_sticker", "args", "width")
@@ -139,6 +152,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Str, "history_sync", "media_requests", "request_method")
 	helper.Copy(up.Int, "history_sync", "media_requests", "request_local_time")
 	helper.Copy(up.Int, "history_sync", "media_requests", "max_async_handle")
+	helper.Copy(up.Bool, "history_sync", "backwards_on_demand")
 }
 
 type DisplaynameParams struct {
@@ -153,7 +167,7 @@ type DisplaynameParams struct {
 	Short  string
 }
 
-func (c *Config) FormatDisplayname(jid types.JID, phone string, contact types.ContactInfo) string {
+func (c *Config) formatDisplayname(jid types.JID, phone string, contact types.ContactInfo) (string, error) {
 	var nameBuf strings.Builder
 	if phone == "" && jid.Server == types.DefaultUserServer {
 		phone = "+" + jid.User
@@ -172,13 +186,21 @@ func (c *Config) FormatDisplayname(jid types.JID, phone string, contact types.Co
 		Name:   contact.FullName,
 		Short:  contact.FirstName,
 	})
+	return nameBuf.String(), err
+}
+
+func (c *Config) FormatDisplayname(jid types.JID, phone string, contact types.ContactInfo) string {
+	name, err := c.formatDisplayname(jid, phone, contact)
 	if err != nil {
 		panic(err)
 	}
-	return nameBuf.String()
+	return name
 }
 
 func redactPhone(phone string) string {
+	if len(phone) <= 4 {
+		return phone
+	}
 	// This doesn't keep 2+ digit country codes properly, but whatever
 	return phone[:2] + strings.Repeat("∙", len(phone)-4) + phone[len(phone)-2:]
 }

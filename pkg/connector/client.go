@@ -29,7 +29,6 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
-	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waWa6"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
@@ -39,6 +38,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/status"
+	"maunium.net/go/mautrix/event"
 
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
 )
@@ -49,7 +49,6 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 		UserLogin: login,
 		MC:        noopMCInstance,
 
-		historySyncs:              make(chan *waHistorySync.HistorySync, 64),
 		historySyncWakeup:         make(chan struct{}, 1),
 		resyncQueue:               make(map[types.JID]resyncQueueItem),
 		directMediaRetries:        make(map[networkid.MessageID]*directMediaRetry),
@@ -86,6 +85,7 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 		w.Client.BackgroundEventCtx = w.UserLogin.Log.WithContext(wa.Bridge.BackgroundCtx)
 		w.Client.SetForceActiveDeliveryReceipts(wa.Config.ForceActiveDeliveryReceipts)
 		w.Client.InitialAutoReconnect = wa.Config.InitialAutoReconnect
+		w.Client.UseRetryMessageStore = wa.Config.UseWhatsAppRetryStore
 	} else {
 		w.UserLogin.Log.Warn().Stringer("jid", w.JID).Msg("No device found for user in whatsmeow store")
 	}
@@ -106,7 +106,6 @@ type WhatsAppClient struct {
 	JID       types.JID
 	MC        mClient
 
-	historySyncs       chan *waHistorySync.HistorySync
 	historySyncWakeup  chan struct{}
 	stopLoops          atomic.Pointer[context.CancelFunc]
 	resyncQueue        map[types.JID]resyncQueueItem
@@ -130,6 +129,7 @@ var (
 	_ bridgev2.PushableNetworkAPI          = (*WhatsAppClient)(nil)
 	_ bridgev2.BackgroundSyncingNetworkAPI = (*WhatsAppClient)(nil)
 	_ bridgev2.ChatViewingNetworkAPI       = (*WhatsAppClient)(nil)
+	_ bridgev2.StickerImportingNetworkAPI  = (*WhatsAppClient)(nil)
 )
 
 var pushCfg = &bridgev2.PushConfig{
@@ -210,6 +210,7 @@ func (wa *WhatsAppClient) Connect(ctx context.Context) {
 	wa.Client.BackgroundEventCtx = wa.UserLogin.Log.WithContext(wa.Main.Bridge.BackgroundCtx)
 	zerolog.Ctx(ctx).Debug().Msg("Connecting to WhatsApp")
 	if err := wa.Client.ConnectContext(ctx); err != nil {
+		wa.callStopLoops()
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to connect to WhatsApp")
 		state := status.BridgeState{
 			StateEvent: status.StateUnknownError,
@@ -265,7 +266,9 @@ func (wa *WhatsAppClient) ConnectBackground(ctx context.Context, params *bridgev
 		return payload
 	}
 	defer func() {
-		wa.Client.GetClientPayload = nil
+		if cli := wa.Client; cli != nil {
+			cli.GetClientPayload = nil
+		}
 	}()
 	err := wa.Client.ConnectContext(ctx)
 	if err != nil {
@@ -334,6 +337,7 @@ func (wa *WhatsAppClient) startLoops() {
 	if oldStop != nil {
 		(*oldStop)()
 	}
+	ctx = wa.UserLogin.Log.WithContext(ctx)
 	go wa.historySyncLoop(ctx)
 	go wa.ghostResyncLoop(ctx)
 	if mrc := wa.Main.Config.HistorySync.MediaRequests; mrc.AutoRequestMedia && mrc.RequestMethod == MediaRequestMethodLocalTime {
@@ -351,10 +355,14 @@ func (wa *WhatsAppClient) GetStore() *store.Device {
 	return store.NoopDevice
 }
 
-func (wa *WhatsAppClient) Disconnect() {
+func (wa *WhatsAppClient) callStopLoops() {
 	if stopHistorySyncLoop := wa.stopLoops.Swap(nil); stopHistorySyncLoop != nil {
 		(*stopHistorySyncLoop)()
 	}
+}
+
+func (wa *WhatsAppClient) Disconnect() {
+	wa.callStopLoops()
 	if cli := wa.Client; cli != nil {
 		cli.Disconnect()
 	}
@@ -460,4 +468,13 @@ func (wa *WhatsAppClient) updatePresence(ctx context.Context, presence types.Pre
 		wa.lastPresence = presence
 	}
 	return err
+}
+
+func (wa *WhatsAppClient) DownloadImagePack(ctx context.Context, url string) (*bridgev2.ImportedImagePack, error) {
+	return wa.Main.MsgConv.DownloadImagePack(ctx, wa.UserLogin.ID, wa.Client, url)
+}
+
+func (wa *WhatsAppClient) ListImagePacks(ctx context.Context) ([]*event.ImagePackMetadata, error) {
+	// TODO
+	return nil, nil
 }
